@@ -379,9 +379,14 @@ def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
 def _save_diary_direct(
     transcript_path: str,
     session_id: str,
+    wing: str = "",
     toast: bool = False,
 ) -> dict:
     """Write a diary checkpoint by calling the tool function directly (no MCP roundtrip).
+
+    If `wing` is set, the entry lands in that wing (typically the project wing
+    derived from the transcript path). Otherwise falls back to `tool_diary_write`'s
+    default of `wing_session-hook`.
 
     Returns {"count": N, "themes": [...]} on success, {"count": 0} on failure.
     """
@@ -407,6 +412,7 @@ def _save_diary_direct(
             agent_name="session-hook",
             entry=entry,
             topic="checkpoint",
+            wing=wing,
         )
         if result.get("success"):
             _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
@@ -481,6 +487,24 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     }
 
 
+def _wing_from_transcript_path(transcript_path: str) -> str:
+    """Derive a project wing name from a Claude Code transcript path.
+
+    Claude Code stores transcripts at:
+        ~/.claude/projects/-home-<user>-Projects-<project>/session.jsonl
+    We extract <project> and return ``wing_<project>`` to match the
+    AAAK_SPEC convention (``wing_user``, ``wing_agent``, ``wing_code``,
+    ``wing_<project>``…). Falls back to ``wing_sessions``.
+    """
+    # Normalize path separators for cross-platform (Windows backslashes)
+    normalized = transcript_path.replace("\\", "/")
+    match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
+    if match:
+        project = match.group(1).lower().replace(" ", "_")
+        return f"wing_{project}"
+    return "wing_sessions"
+
+
 def hook_stop(data: dict, harness: str):
     """Stop hook: block every N messages for auto-save."""
     parsed = _parse_harness_input(data, harness)
@@ -543,11 +567,15 @@ def hook_stop(data: dict, harness: str):
             silent = True
             toast = False
 
+        project_wing = _wing_from_transcript_path(transcript_path)
+
         if silent:
             # Save directly via Python API — systemMessage renders in terminal
             result = {"count": 0}
             if transcript_path:
-                result = _save_diary_direct(transcript_path, session_id, toast=toast)
+                result = _save_diary_direct(
+                    transcript_path, session_id, wing=project_wing, toast=toast
+                )
                 _ingest_transcript(transcript_path)
             _maybe_auto_ingest(transcript_path)
             # Only advance save marker after successful save
@@ -580,7 +608,8 @@ def hook_stop(data: dict, harness: str):
             if transcript_path:
                 _ingest_transcript(transcript_path)
             _maybe_auto_ingest(transcript_path)
-            _output({"decision": "block", "reason": STOP_BLOCK_REASON})
+            reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
+            _output({"decision": "block", "reason": reason})
     else:
         _output({})
 
