@@ -184,6 +184,7 @@ class KnowledgeGraphSurreal:
         source_file: Optional[str] = None,
         source_drawer_id: Optional[str] = None,
         adapter_name: Optional[str] = None,
+        extracted_at: Optional[str] = None,
     ) -> str:
         """Add a ``subject -> predicate -> object`` edge.
 
@@ -194,6 +195,13 @@ class KnowledgeGraphSurreal:
         Dedupe rule mirrors SQLite: if an *open* triple (``valid_to IS
         NONE``) with the same ``(subject, predicate, object)`` already
         exists, return its id without creating a new edge.
+
+        ``extracted_at`` (mp-3lc) is optional. When ``None`` the edge
+        stamps ``time::now()`` (default behaviour — preserves mp-2um).
+        Callers that need to preserve provenance (the SQLite→Surreal KG
+        migration is the motivating case) pass the source row's original
+        timestamp as an ISO 8601 string; it is stored as a Surreal
+        ``datetime`` via ``<datetime>`` casting.
         """
         sub_rec = self._entity_record(subject)
         obj_rec = self._entity_record(obj)
@@ -210,13 +218,35 @@ class KnowledgeGraphSurreal:
             {"rec": obj_rec, "name": obj},
         )
 
-        existing = self._db.query(
-            (
-                "SELECT id FROM triple WHERE in = $sub AND out = $obj "
-                "AND predicate = $pred AND valid_to IS NONE"
-            ),
-            {"sub": sub_rec, "obj": obj_rec, "pred": pred},
-        )
+        # Dedupe rule: an open triple (valid_to IS NONE) matches on
+        # (sub, pred, obj). A closed triple additionally matches on the
+        # full (valid_from, valid_to) span so re-running a migration of
+        # historical facts does not create duplicates. The SQLite KG
+        # itself only dedupes the open case; we strengthen the Surreal
+        # path for idempotent migrations (mp-3lc).
+        if valid_to is None:
+            existing = self._db.query(
+                (
+                    "SELECT id FROM triple WHERE in = $sub AND out = $obj "
+                    "AND predicate = $pred AND valid_to IS NONE"
+                ),
+                {"sub": sub_rec, "obj": obj_rec, "pred": pred},
+            )
+        else:
+            existing = self._db.query(
+                (
+                    "SELECT id FROM triple WHERE in = $sub AND out = $obj "
+                    "AND predicate = $pred AND valid_from = $valid_from "
+                    "AND valid_to = $valid_to"
+                ),
+                {
+                    "sub": sub_rec,
+                    "obj": obj_rec,
+                    "pred": pred,
+                    "valid_from": valid_from,
+                    "valid_to": valid_to,
+                },
+            )
         if existing:
             return str(existing[0]["id"])
 
@@ -225,9 +255,18 @@ class KnowledgeGraphSurreal:
         # DEFAULT time::now()`` — but this port uses SCHEMALESS tables, so
         # the DEFAULT never fires and triples had no provenance timestamp,
         # regressing parity with the SQLite KG (knowledge_graph.py:88).
-        # Set ``extracted_at = time::now()`` explicitly on the RELATE so
-        # every new edge carries an insertion-time stamp regardless of
-        # whether we later tighten the schema (mp-6gu).
+        # Set ``extracted_at`` explicitly on the RELATE so every new edge
+        # carries a timestamp regardless of whether we later tighten the
+        # schema (mp-6gu). mp-3lc: if the caller supplied an ISO string
+        # we cast it to a Surreal ``datetime`` literal so it survives
+        # across the schema-tightening pass without a data rewrite.
+        if extracted_at is None:
+            extracted_clause = "extracted_at = time::now()"
+            extracted_param: dict[str, Any] = {}
+        else:
+            extracted_clause = "extracted_at = <datetime> $extracted_at"
+            extracted_param = {"extracted_at": extracted_at}
+
         created = self._db.query(
             (
                 "RELATE $sub->triple->$obj SET "
@@ -239,7 +278,7 @@ class KnowledgeGraphSurreal:
                 "source_file = $source_file, "
                 "source_drawer_id = $source_drawer_id, "
                 "adapter_name = $adapter_name, "
-                "extracted_at = time::now()"
+                f"{extracted_clause}"
             ),
             {
                 "sub": sub_rec,
@@ -252,6 +291,7 @@ class KnowledgeGraphSurreal:
                 "source_file": source_file,
                 "source_drawer_id": source_drawer_id,
                 "adapter_name": adapter_name,
+                **extracted_param,
             },
         )
         if not created:

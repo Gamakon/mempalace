@@ -253,6 +253,136 @@ def cmd_migrate(args):
     )
 
 
+def cmd_migrate_to_surreal(args):
+    """Migrate Chroma drawers + embeddings into SurrealDB (mp-ciw).
+
+    Sibling to ``migrate-kg-to-surreal``: the KG command moves the SQLite
+    knowledge-graph entities/triples, this one moves the Chroma drawer
+    payload (verbatim text + embeddings + metadata). Both are idempotent;
+    running either twice lands the same final state in Surreal.
+    """
+    from .migrate import migrate_to_surreal
+
+    source = (
+        os.path.expanduser(args.source)
+        if getattr(args, "source", None)
+        else (os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path)
+    )
+    try:
+        result = migrate_to_surreal(
+            source_palace=source,
+            target_ns=args.target_ns,
+            target_db=args.target_db,
+            dry_run=args.dry_run,
+            batch_size=args.batch_size,
+        )
+    except FileNotFoundError as e:
+        print(f"\n  {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        # migrate_to_surreal already printed where it stopped via progress
+        # output; surface the exception and exit non-zero so CI / scripts
+        # see the failure.
+        print(f"\n  Migration failed: {e}", file=sys.stderr)
+        sys.exit(2)
+    if not result.get("verified", True):
+        sys.exit(3)
+
+    # mp-3lc: optionally fold the KG migration onto the same command.
+    # Using the same target NS lets a user run `migrate-to-surreal
+    # --include-kg` and get both drawers and graph into one SurrealDB
+    # namespace — the standalone `migrate-kg-to-surreal` is still
+    # available for KG-only re-runs.
+    if getattr(args, "include_kg", False):
+        from .migrate_kg import migrate_kg_to_surreal
+
+        sqlite_path = (
+            os.path.expanduser(args.kg_sqlite)
+            if getattr(args, "kg_sqlite", None)
+            else os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+        )
+        if not os.path.isfile(sqlite_path):
+            print(
+                f"\n  --include-kg: no knowledge graph at {sqlite_path}, skipping",
+                file=sys.stderr,
+            )
+            return
+        namespace = args.target_ns or os.environ.get("MEMPALACE_SURREAL_NS", "mempalace")
+        # Use the same target DB as the drawers so a caller ends up with
+        # one unified Surreal database per palace.
+        from .migrate import _derive_surreal_db_name  # type: ignore[attr-defined]
+
+        source = (
+            os.path.expanduser(args.source)
+            if getattr(args, "source", None)
+            else (os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path)
+        )
+        db_name = args.target_db or _derive_surreal_db_name(source)
+        print("\n  --include-kg: migrating SQLite KG...")
+        kg_result = migrate_kg_to_surreal(
+            sqlite_path,
+            namespace=namespace,
+            database=db_name,
+        )
+        if not kg_result.ok:
+            sys.exit(4)
+
+
+def cmd_migrate_kg_to_surreal(args):
+    """Copy the SQLite knowledge graph into SurrealDB (mp-3lc).
+
+    A separate command (rather than folded into ``mempalace migrate``)
+    because ``migrate`` is the ChromaDB-version recovery tool, a totally
+    different operation. When mp-ciw's ``migrate-to-surreal`` lands, this
+    can be unified behind a ``--include-kg`` flag — see
+    ``mempalace/migrate_kg.py`` docstring.
+    """
+    from .migrate_kg import migrate_kg_to_surreal
+
+    sqlite_path = (
+        os.path.expanduser(args.sqlite)
+        if args.sqlite
+        else os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+    )
+
+    if not os.path.isfile(sqlite_path):
+        print(f"\n  No knowledge graph found at {sqlite_path}")
+        return
+
+    print(f"\n{'=' * 60}")
+    print("  MemPalace — Migrate KG to SurrealDB")
+    print(f"{'=' * 60}\n")
+    print(f"  Source (SQLite): {sqlite_path}")
+    print(f"  Target (Surreal): {args.url} NS={args.namespace} DB={args.database}\n")
+
+    try:
+        result = migrate_kg_to_surreal(
+            sqlite_path,
+            url=args.url,
+            user=args.user,
+            password=args.password,
+            namespace=args.namespace,
+            database=args.database,
+            verify_sample_size=args.verify_sample,
+        )
+    except Exception as exc:  # pragma: no cover - surfaces connection errors
+        print(f"\n  Migration failed: {exc}")
+        raise
+
+    print("\n  Summary:")
+    print(f"    entities: {result.entities_written}/{result.entities_source}")
+    print(f"    triples:  {result.triples_written}/{result.triples_source}")
+    if result.verification_sampled:
+        print(
+            f"    verification: {result.verification_ok}/"
+            f"{result.verification_sampled} sampled triples round-tripped"
+        )
+    if not result.ok:
+        print("  WARNING: some counts did not match — inspect output above.")
+    else:
+        print("  OK.")
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -702,6 +832,79 @@ def main():
         "--yes", action="store_true", help="Skip confirmation for destructive changes"
     )
 
+    # migrate-to-surreal (mp-ciw)
+    p_migrate_surreal = sub.add_parser(
+        "migrate-to-surreal",
+        help="Copy Chroma drawers + embeddings into SurrealDB (idempotent, read-only source)",
+    )
+    p_migrate_surreal.add_argument(
+        "--source",
+        default=None,
+        help="Path to Chroma palace directory (default: --palace or config palace_path)",
+    )
+    p_migrate_surreal.add_argument(
+        "--target-ns",
+        default=None,
+        help="SurrealDB namespace (default: MEMPALACE_SURREAL_NS env or 'mempalace')",
+    )
+    p_migrate_surreal.add_argument(
+        "--target-db",
+        default=None,
+        help="SurrealDB database name (default: derived from palace path)",
+    )
+    p_migrate_surreal.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count what would be migrated without writing anything",
+    )
+    p_migrate_surreal.add_argument(
+        "--batch-size",
+        type=int,
+        default=200,
+        help="Drawer batch size for the read + upsert loop (default: 200)",
+    )
+    p_migrate_surreal.add_argument(
+        "--include-kg",
+        action="store_true",
+        help=(
+            "Also migrate the SQLite knowledge graph "
+            "(~/.mempalace/knowledge_graph.sqlite3) into the target SurrealDB. "
+            "See `migrate-kg-to-surreal` for standalone KG migration (mp-3lc)."
+        ),
+    )
+    p_migrate_surreal.add_argument(
+        "--kg-sqlite",
+        default=None,
+        help=(
+            "SQLite KG path when --include-kg is set "
+            "(default: ~/.mempalace/knowledge_graph.sqlite3)"
+        ),
+    )
+
+    # migrate-kg-to-surreal (mp-3lc)
+    p_migrate_kg = sub.add_parser(
+        "migrate-kg-to-surreal",
+        help="Copy the SQLite knowledge graph (entities+triples) into SurrealDB",
+    )
+    p_migrate_kg.add_argument(
+        "--sqlite",
+        default=None,
+        help="SQLite KG path (default: ~/.mempalace/knowledge_graph.sqlite3)",
+    )
+    p_migrate_kg.add_argument("--url", default="ws://127.0.0.1:8000", help="SurrealDB URL")
+    p_migrate_kg.add_argument("--user", default="root", help="SurrealDB user")
+    p_migrate_kg.add_argument("--password", default="root", help="SurrealDB password")
+    p_migrate_kg.add_argument(
+        "--namespace", default="mempalace", help="SurrealDB namespace (default: mempalace)"
+    )
+    p_migrate_kg.add_argument("--database", default="kg", help="SurrealDB database (default: kg)")
+    p_migrate_kg.add_argument(
+        "--verify-sample",
+        type=int,
+        default=10,
+        help="How many random triples to round-trip verify after migration (0 disables)",
+    )
+
     sub.add_parser("status", help="Show what's been filed")
 
     args = parser.parse_args()
@@ -738,6 +941,8 @@ def main():
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "migrate": cmd_migrate,
+        "migrate-to-surreal": cmd_migrate_to_surreal,
+        "migrate-kg-to-surreal": cmd_migrate_kg_to_surreal,
         "status": cmd_status,
     }
     dispatch[args.command](args)
