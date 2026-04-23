@@ -304,15 +304,16 @@ _COLLECTION_MAP = (
 )
 
 
-def _open_chroma_readonly(palace_path: str):
-    """Return a ChromaBackend for read-only use against ``palace_path``.
+def _new_chroma_backend():
+    """Construct a fresh :class:`ChromaBackend` for the migration pipeline.
 
-    ChromaDB's PersistentClient has no explicit read-only mode, so we treat
-    the backend as read-only by discipline: the migration pipeline only
-    calls ``count()`` and ``get(...)`` on the returned backend's
-    collections — never ``add``/``upsert``/``update``/``delete``. The
-    palace directory is not chmod'd; callers are responsible for honoring
-    the read-only contract.
+    The backend is not palace-scoped — palace paths are passed through on
+    each ``get_collection`` call. ChromaDB's ``PersistentClient`` has no
+    explicit read-only mode, so the migration pipeline treats the backend
+    as read-only by discipline: it only calls ``count()`` and ``get(...)``
+    on returned collections — never ``add``/``upsert``/``update``/
+    ``delete``. The palace directory is not chmod'd; callers are
+    responsible for honoring the read-only contract.
     """
     from .backends.chroma import ChromaBackend
 
@@ -818,9 +819,7 @@ def _migrate_one_collection(
         # (mp-dju) for a dedicated post-migration audit when needed.
         ok = col_migrated == src_count
         if not ok:
-            errors.append(
-                f"{src_name}: migrated {col_migrated} but source count was {src_count}"
-            )
+            errors.append(f"{src_name}: migrated {col_migrated} but source count was {src_count}")
     else:
         ok, verify_errors = _verify_migration(src_col, dst_col, label=src_name)
         errors.extend(verify_errors)
@@ -904,11 +903,9 @@ def migrate_to_surreal(
         # the Surreal auto-embed path regenerates them on upsert. Counts
         # come from the SQL COUNT on the segments-joined embeddings rows.
         chroma_backend = None
-        source_collections, source_counts = _open_source_collections_sqlite(
-            source_palace, progress
-        )
+        source_collections, source_counts = _open_source_collections_sqlite(source_palace, progress)
     else:
-        chroma_backend = _open_chroma_readonly(source_palace)
+        chroma_backend = _new_chroma_backend()
         source_collections, source_counts = _open_source_collections(
             chroma_backend, source_palace, progress
         )
