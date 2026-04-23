@@ -227,21 +227,168 @@ class TestStats:
         assert set(stats["relationship_types"]) == {"parent_of", "works_at", "does"}
 
 
-# ── Deferred operations ────────────────────────────────────────────────
+# ── Timeline (mp-84n) ──────────────────────────────────────────────────
 
 
-class TestDeferredToMp84n:
-    """Temporal invalidate + full timeline land in mp-84n; make sure the
-    stubs speak up instead of silently returning stale answers."""
+class TestTimeline:
+    def test_timeline_global_ascending(self, seeded_kg):
+        """Oldest-first ordering on valid_from."""
+        tl = seeded_kg.timeline()
+        dated = [t["valid_from"] for t in tl if t["valid_from"] is not None]
+        assert dated == sorted(dated)
 
-    def test_invalidate_raises(self, kg):
-        with pytest.raises(NotImplementedError, match="mp-84n"):
-            kg.invalidate("Alice", "works_at", "Acme")
+    def test_timeline_descending(self, seeded_kg):
+        """``order='desc'`` flips the chronological direction."""
+        tl = seeded_kg.timeline(order="desc")
+        dated = [t["valid_from"] for t in tl if t["valid_from"] is not None]
+        assert dated == sorted(dated, reverse=True)
 
-    def test_timeline_raises(self, kg):
-        with pytest.raises(NotImplementedError, match="mp-84n"):
-            kg.timeline()
+    def test_timeline_invalid_order_raises(self, kg):
+        with pytest.raises(ValueError):
+            kg.timeline(order="sideways")
 
-    def test_seed_from_entity_facts_raises(self, kg):
-        with pytest.raises(NotImplementedError, match="mp-84n"):
-            kg.seed_from_entity_facts({})
+    def test_timeline_valid_from_none_sorts_last(self, kg):
+        """Triples with ``valid_from IS NONE`` always come last (NULLS LAST
+        parity with the SQLite KG), regardless of asc/desc."""
+        # First entry has no valid_from — this is the fallback case.
+        kg.add_triple("Alice", "knows", "Bob")  # valid_from=None
+        kg.add_triple("Carol", "knows", "Dave", valid_from="2020-01-01")
+        kg.add_triple("Erin", "knows", "Frank", valid_from="2025-01-01")
+
+        asc = kg.timeline(order="asc")
+        assert asc[-1]["valid_from"] is None  # Alice/Bob pushed to end
+        assert asc[0]["valid_from"] == "2020-01-01"
+
+        desc = kg.timeline(order="desc")
+        assert desc[-1]["valid_from"] is None  # still last in desc
+        assert desc[0]["valid_from"] == "2025-01-01"
+
+    def test_timeline_filters_by_entity(self, seeded_kg):
+        tl = seeded_kg.timeline("Max")
+        touched = {t["subject"] for t in tl} | {t["object"] for t in tl}
+        assert "Max" in touched
+        # Alice-only triples like "Alice works_at Acme Corp" should be
+        # excluded unless Max is one of the endpoints.
+        assert not any(t["subject"] != "Max" and t["object"] != "Max" for t in tl), tl
+
+    def test_timeline_respects_limit(self, kg):
+        for i in range(10):
+            kg.add_triple("hub", "connects_to", f"spoke_{i}", valid_from=f"2025-01-{i + 1:02d}")
+        tl = kg.timeline(limit=3)
+        assert len(tl) == 3
+
+
+# ── Invalidate (mp-84n) ────────────────────────────────────────────────
+
+
+class TestInvalidate:
+    def test_invalidate_sets_valid_to(self, kg):
+        tid = kg.add_triple("Alice", "works_at", "Acme", valid_from="2020-01-01")
+        changed = kg.invalidate(tid, valid_to="2024-06-01")
+        assert changed is True
+
+        rows = kg.query_relationship("works_at")
+        assert len(rows) == 1
+        assert rows[0]["valid_to"] == "2024-06-01"
+        assert rows[0]["current"] is False
+
+    def test_invalidate_defaults_valid_to_to_today(self, kg):
+        from datetime import date
+
+        tid = kg.add_triple("Alice", "works_at", "Acme")
+        assert kg.invalidate(tid) is True
+
+        rows = kg.query_relationship("works_at")
+        assert rows[0]["valid_to"] == date.today().isoformat()
+
+    def test_invalidate_is_idempotent(self, kg):
+        """Second call on the same (already-closed) triple is a no-op."""
+        tid = kg.add_triple("Alice", "works_at", "Acme")
+        assert kg.invalidate(tid, valid_to="2024-06-01") is True
+        # Second call should not overwrite the earlier valid_to or create
+        # a second closure event.
+        assert kg.invalidate(tid, valid_to="2099-12-31") is False
+
+        rows = kg.query_relationship("works_at")
+        assert rows[0]["valid_to"] == "2024-06-01"
+
+    def test_invalidate_unknown_triple_returns_false(self, kg):
+        assert kg.invalidate("triple:does_not_exist") is False
+
+    def test_invalidate_accepts_bare_rid(self, kg):
+        """Callers may pass ``"<rid>"`` as well as ``"triple:<rid>"``."""
+        tid = kg.add_triple("Alice", "works_at", "Acme")
+        bare = tid.split(":", 1)[1]
+        assert kg.invalidate(bare, valid_to="2024-06-01") is True
+
+    def test_invalidated_triple_allows_re_add(self, kg):
+        """After closing an open triple, re-adding it creates a new open
+        row (matches SQLite ``test_invalidated_triple_allows_re_add``)."""
+        a = kg.add_triple("Alice", "works_at", "Acme")
+        kg.invalidate(a, valid_to="2024-06-01")
+        b = kg.add_triple("Alice", "works_at", "Acme")
+        assert a != b
+        assert kg.stats()["triples"] == 2
+        assert kg.stats()["current_facts"] == 1
+
+
+# ── seed_from_entity_facts (mp-84n) ────────────────────────────────────
+
+
+class TestSeedFromEntityFacts:
+    def test_seed_person_with_partner(self, kg):
+        kg.seed_from_entity_facts(
+            {
+                "alice": {
+                    "full_name": "Alice Smith",
+                    "type": "person",
+                    "gender": "female",
+                    "partner": "bob",
+                    "relationship": "husband",
+                }
+            }
+        )
+        results = kg.query_entity("Alice Smith", direction="outgoing")
+        predicates = {r["predicate"] for r in results}
+        assert "married_to" in predicates
+        assert "is_partner_of" in predicates
+
+    def test_seed_child(self, kg):
+        kg.seed_from_entity_facts(
+            {
+                "max": {
+                    "full_name": "Max",
+                    "type": "person",
+                    "birthday": "2015-04-01",
+                    "parent": "alice",
+                    "relationship": "daughter",
+                }
+            }
+        )
+        results = kg.query_entity("Max", direction="outgoing")
+        predicates = {r["predicate"] for r in results}
+        assert "child_of" in predicates
+        assert "is_child_of" in predicates
+
+    def test_seed_interests(self, kg):
+        kg.seed_from_entity_facts(
+            {
+                "max": {
+                    "full_name": "Max",
+                    "type": "person",
+                    "interests": ["swimming", "chess"],
+                }
+            }
+        )
+        results = kg.query_entity("Max", direction="outgoing")
+        loves = {r["object"] for r in results if r["predicate"] == "loves"}
+        assert loves == {"Swimming", "Chess"}
+
+    def test_seed_minimal_facts_creates_entity(self, kg):
+        kg.seed_from_entity_facts({"bob": {"full_name": "Bob"}})
+        assert kg.stats()["entities"] >= 1
+
+    def test_seed_empty_is_noop(self, kg):
+        kg.seed_from_entity_facts({})
+        assert kg.stats()["entities"] == 0
+        assert kg.stats()["triples"] == 0

@@ -16,11 +16,10 @@ Scope (mp-4yf):
     - ``list_triples``         basic listing helper (no SQLite equivalent)
     - ``stats``                counts + distinct predicates
 
-Out of scope for this task (stubbed — raise ``NotImplementedError`` pointing
-at mp-84n):
-    - ``timeline``
-    - ``invalidate`` (write-side temporal close)
-    - ``seed_from_entity_facts``
+Scope (mp-84n, this module):
+    - ``timeline``             entity-filtered/global chronological scan
+    - ``invalidate``           set ``valid_to`` on an open triple by id
+    - ``seed_from_entity_facts`` bootstrap from ``fact_checker.ENTITY_FACTS``
 
 Connection model:
     A fresh ``KnowledgeGraphSurreal`` signs in to the local SurrealDB
@@ -45,6 +44,7 @@ Schema notes:
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any, Optional
 
 from surrealdb import RecordID, Surreal
@@ -233,11 +233,46 @@ class KnowledgeGraphSurreal:
             raise RuntimeError(f"RELATE returned no record for {subject}->{pred}->{obj}")
         return str(created[0]["id"])
 
-    def invalidate(self, *_args, **_kwargs) -> None:
-        """Temporal close of an open triple. Deferred to mp-84n."""
-        raise NotImplementedError(
-            "Temporal invalidate is out of scope for mp-4yf; tracked in mp-84n."
+    def invalidate(self, triple_id: str, valid_to: Optional[str] = None) -> bool:
+        """Close an open triple by id.
+
+        Parameters
+        ----------
+        triple_id:
+            The Surreal record id of the triple, in either the opaque
+            ``"triple:<rid>"`` form returned by :meth:`add_triple` or the
+            bare ``"<rid>"`` form.
+        valid_to:
+            ISO date/datetime string to stamp on the triple's ``valid_to``
+            field. Defaults to today's ISO date, matching the SQLite KG.
+
+        Returns
+        -------
+        ``True`` if an open triple was closed, ``False`` if the triple
+        either didn't exist or was already closed (idempotent: re-calling
+        with the same ``triple_id`` never double-sets ``valid_to`` or
+        overwrites a prior close).
+
+        Notes
+        -----
+        Parity with ``KnowledgeGraph.invalidate`` is by *semantics* (close
+        only open triples, idempotent) rather than by signature — Surreal
+        gives us stable record ids so we key off those directly instead of
+        re-resolving the ``(subject, predicate, object)`` triplet. The
+        SQLite ``invalidate(subject, predicate, object, ended)`` surface is
+        still available at the caller layer; it can resolve the id via
+        :meth:`query_entity` and hand it to us.
+        """
+        rid = triple_id.split(":", 1)[1] if triple_id.startswith("triple:") else triple_id
+        rec = RecordID("triple", rid)
+        stamp = valid_to if valid_to is not None else date.today().isoformat()
+        updated = self._db.query(
+            "UPDATE $rec SET valid_to = $valid_to WHERE valid_to IS NONE",
+            {"rec": rec, "valid_to": stamp},
         )
+        # SurrealDB returns the updated rows (empty list if nothing matched
+        # the ``valid_to IS NONE`` predicate — that's the idempotency path).
+        return bool(updated)
 
     # ── Query operations ───────────────────────────────────────────────
 
@@ -251,7 +286,7 @@ class KnowledgeGraphSurreal:
         """
         vf = f"{prefix}valid_from" if prefix else "valid_from"
         vt = f"{prefix}valid_to" if prefix else "valid_to"
-        return f"({vf} IS NONE OR {vf} <= $as_of) " f"AND ({vt} IS NONE OR {vt} >= $as_of)"
+        return f"({vf} IS NONE OR {vf} <= $as_of) AND ({vt} IS NONE OR {vt} >= $as_of)"
 
     def query_entity(
         self,
@@ -361,15 +396,119 @@ class KnowledgeGraphSurreal:
             for r in rows
         ]
 
-    def timeline(self, *_args, **_kwargs) -> list[dict[str, Any]]:
-        """Full chronological traversal. Deferred to mp-84n."""
-        raise NotImplementedError("timeline() is out of scope for mp-4yf; tracked in mp-84n.")
+    def timeline(
+        self,
+        entity_name: Optional[str] = None,
+        limit: int = 100,
+        order: str = "asc",
+    ) -> list[dict[str, Any]]:
+        """Return triples ordered chronologically by ``valid_from``.
 
-    def seed_from_entity_facts(self, *_args, **_kwargs) -> None:
-        """Bootstrap from fact_checker.ENTITY_FACTS. Deferred to mp-84n."""
-        raise NotImplementedError(
-            "seed_from_entity_facts() is out of scope for mp-4yf; tracked in mp-84n."
+        Parameters
+        ----------
+        entity_name:
+            When set, restricts results to triples where the entity appears
+            as either subject or object. When ``None``, returns a global
+            timeline (parity with ``KnowledgeGraph.timeline(None)``).
+        limit:
+            Maximum number of rows. Matches SQLite's hard cap of 100 by
+            default; caller can raise or lower.
+        order:
+            ``"asc"`` (default, oldest first) or ``"desc"`` (newest first).
+            Triples whose ``valid_from`` is NONE always sort *last*
+            regardless of direction — mirrors the SQLite ``NULLS LAST``
+            clause so callers comparing timelines across backends see the
+            same shape.
+
+        Notes
+        -----
+        SurrealQL 3.0.4 does not support ``ORDER BY ... NULLS LAST``, so we
+        synthesise a leading ``null_sort`` column (``0`` when ``valid_from``
+        is set, ``1`` when it's NONE) and order on that first. The effect
+        is identical and the extra field is stripped before return.
+        """
+        order_norm = order.lower()
+        if order_norm not in ("asc", "desc"):
+            raise ValueError(f"order must be 'asc' or 'desc', got {order!r}")
+        direction_clause = "ASC" if order_norm == "asc" else "DESC"
+
+        select = (
+            "SELECT id, predicate, valid_from, valid_to, "
+            "in.name AS sub_name, out.name AS obj_name, "
+            "IF valid_from IS NONE THEN 1 ELSE 0 END AS null_sort "
+            "FROM triple"
         )
+        params: dict[str, Any] = {"limit": limit}
+        if entity_name is not None:
+            select += " WHERE in = $rec OR out = $rec"
+            params["rec"] = self._entity_record(entity_name)
+        select += f" ORDER BY null_sort ASC, valid_from {direction_clause} LIMIT $limit"
+
+        rows = self._db.query(select, params) or []
+        return [
+            {
+                "subject": r["sub_name"],
+                "predicate": r["predicate"],
+                "object": r["obj_name"],
+                "valid_from": r.get("valid_from"),
+                "valid_to": r.get("valid_to"),
+                "current": r.get("valid_to") is None,
+            }
+            for r in rows
+        ]
+
+    def seed_from_entity_facts(self, entity_facts: dict[str, dict[str, Any]]) -> None:
+        """Bootstrap the graph from ``fact_checker.ENTITY_FACTS``.
+
+        Mirrors :meth:`KnowledgeGraph.seed_from_entity_facts` exactly — same
+        predicate names, same capitalisation rules, same ``valid_from``
+        defaults. Pure batch wrapper over :meth:`add_entity` /
+        :meth:`add_triple`; de-dupe is the usual open-triple rule on the
+        write path.
+        """
+        for key, facts in entity_facts.items():
+            name = facts.get("full_name", key.capitalize())
+            etype = facts.get("type", "person")
+            self.add_entity(
+                name,
+                etype,
+                {
+                    "gender": facts.get("gender", ""),
+                    "birthday": facts.get("birthday", ""),
+                },
+            )
+
+            parent = facts.get("parent")
+            if parent:
+                self.add_triple(
+                    name,
+                    "child_of",
+                    parent.capitalize(),
+                    valid_from=facts.get("birthday"),
+                )
+
+            partner = facts.get("partner")
+            if partner:
+                self.add_triple(name, "married_to", partner.capitalize())
+
+            relationship = facts.get("relationship", "")
+            if relationship == "daughter":
+                self.add_triple(
+                    name,
+                    "is_child_of",
+                    facts.get("parent", "").capitalize() or name,
+                    valid_from=facts.get("birthday"),
+                )
+            elif relationship == "husband":
+                self.add_triple(name, "is_partner_of", facts.get("partner", name).capitalize())
+            elif relationship == "brother":
+                self.add_triple(name, "is_sibling_of", facts.get("sibling", name).capitalize())
+            elif relationship == "dog":
+                self.add_triple(name, "is_pet_of", facts.get("owner", name).capitalize())
+                self.add_entity(name, "animal")
+
+            for interest in facts.get("interests", []):
+                self.add_triple(name, "loves", interest.capitalize(), valid_from="2025-01-01")
 
     # ── Stats ──────────────────────────────────────────────────────────
 
