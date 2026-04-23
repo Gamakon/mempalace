@@ -11,7 +11,9 @@ instead of the real user profile.
 """
 
 import os
+import random
 import shutil
+import sys
 import tempfile
 
 # ── Isolate HOME before any mempalace imports ──────────────────────────
@@ -32,6 +34,53 @@ import pytest  # noqa: E402
 
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
+
+
+# ── Chaos-seed CLI option (mp-ou9) ─────────────────────────────────────
+#
+# Tests that introduce deliberate randomness (e.g. the SIGKILL timing in
+# ``tests/test_surreal_multiprocess.py``) must be reproducible. A
+# `--chaos-seed` CLI option lets a developer replay a flaky CI run by
+# re-invoking pytest with the exact seed printed in the original log.
+#
+# When not supplied, a fresh random seed is generated for each session
+# and printed to stdout so CI logs always capture it.
+
+
+def pytest_addoption(parser):
+    """Register the --chaos-seed option for reproducible chaos tests."""
+    parser.addoption(
+        "--chaos-seed",
+        action="store",
+        default=None,
+        type=int,
+        help=(
+            "Seed for randomised chaos tests (e.g. SIGKILL timing in "
+            "test_surreal_multiprocess). Default: fresh random int, "
+            "printed at session start so CI logs capture it."
+        ),
+    )
+
+
+def pytest_configure(config):
+    """Resolve the chaos seed once per session and print it to stdout."""
+    seed = config.getoption("--chaos-seed")
+    if seed is None:
+        # 63-bit positive int — wide enough to avoid collisions, narrow
+        # enough to copy-paste from a CI log without scientific notation.
+        seed = random.SystemRandom().randrange(1, 2**63)
+    config._chaos_seed = int(seed)
+    # Print unconditionally so both passing and failing runs capture it.
+    # Use sys.stdout.write (not print) so the message survives even when
+    # pytest is configured with -s/--capture=no restrictions.
+    sys.stdout.write(f"\n[chaos-seed] using seed: {config._chaos_seed}\n")
+    sys.stdout.flush()
+
+
+@pytest.fixture(scope="session")
+def chaos_seed(request) -> int:
+    """Return the session-wide chaos seed resolved in pytest_configure."""
+    return int(request.config._chaos_seed)
 
 
 @pytest.fixture(autouse=True)

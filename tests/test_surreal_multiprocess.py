@@ -755,7 +755,7 @@ def test_four_processes_stress_no_loss(isolated_namespace, palace_id):
 # ---------------------------------------------------------------------------
 
 
-def test_sigkilled_bootstrap_peer_recovers(isolated_namespace, palace_id):
+def test_sigkilled_bootstrap_peer_recovers(isolated_namespace, palace_id, chaos_seed):
     """Kill child A mid-bootstrap; child B must still converge cleanly.
 
     Exercises the partial-bootstrap recovery path in ``get_collection``
@@ -763,10 +763,26 @@ def test_sigkilled_bootstrap_peer_recovers(isolated_namespace, palace_id):
     but before ``palace_meta:main`` is UPSERTed, child B must re-run
     bootstrap rather than treating the tables-exist observation as
     "ready".
+
+    Chaos replay (mp-ou9): every timing decision in this test derives
+    from a seeded ``random.Random`` instance. If the test flakes on CI,
+    re-run with ``pytest ... --chaos-seed N`` (N is printed in the
+    failure message and at session start) to reproduce the exact timing.
     """
     import random as _random
     import signal
     import time
+
+    # Local Random instance — never touch the global random state so
+    # other tests stay independent of this seed.
+    rng = _random.Random(chaos_seed)
+    sigkill_delay = rng.uniform(0.0, 0.2)
+    # Include the seed and computed delay in a banner printed to stdout
+    # so CI logs carry the replay recipe on both success and failure.
+    print(
+        f"[chaos-seed] test_sigkilled_bootstrap_peer_recovers "
+        f"seed={chaos_seed} sigkill_delay={sigkill_delay:.6f}s"
+    )
 
     ctx = _spawn_ctx()
     q_a: "mp.Queue" = ctx.Queue()
@@ -783,13 +799,17 @@ def test_sigkilled_bootstrap_peer_recovers(isolated_namespace, palace_id):
     # Let the child start but kill it at a random moment within the first
     # 200ms. Some runs will land the SIGKILL mid-bootstrap, some after the
     # first successful bootstrap loop iteration — both are valid chaos.
-    time.sleep(_random.uniform(0.0, 0.2))
+    time.sleep(sigkill_delay)
     try:
         os.kill(child_a.pid, signal.SIGKILL)
     except ProcessLookupError:  # pragma: no cover - child exited already
         pass
     child_a.join(timeout=5)
-    assert not child_a.is_alive(), f"child {child_a.pid} did not die from SIGKILL"
+    assert not child_a.is_alive(), (
+        f"child {child_a.pid} did not die from SIGKILL "
+        f"(replay with --chaos-seed {chaos_seed}, "
+        f"sigkill_delay={sigkill_delay:.6f}s)"
+    )
 
     # Child B: open the same palace, add one drawer, read it back. This
     # MUST succeed, regardless of what state child A left the catalog in.
@@ -806,13 +826,25 @@ def test_sigkilled_bootstrap_peer_recovers(isolated_namespace, palace_id):
     )
     child_b.start()
     child_b.join(timeout=60)
-    assert not child_b.is_alive(), f"child {child_b.pid} did not exit within 60s"
+    assert not child_b.is_alive(), (
+        f"child {child_b.pid} did not exit within 60s "
+        f"(replay with --chaos-seed {chaos_seed}, "
+        f"sigkill_delay={sigkill_delay:.6f}s)"
+    )
 
     results: list[dict] = []
     while not q_b.empty():
         results.append(q_b.get_nowait())
-    assert len(results) == 1, f"expected 1 child-B result, got {results}"
-    assert results[0]["ok"], f"child B failed after SIGKILL of A: {results[0]!r}"
+    assert len(results) == 1, (
+        f"expected 1 child-B result, got {results} "
+        f"(replay with --chaos-seed {chaos_seed}, "
+        f"sigkill_delay={sigkill_delay:.6f}s)"
+    )
+    assert results[0]["ok"], (
+        f"child B failed after SIGKILL of A: {results[0]!r} "
+        f"(replay with --chaos-seed {chaos_seed}, "
+        f"sigkill_delay={sigkill_delay:.6f}s)"
+    )
 
     # Parent-side read-back: the one drawer child B wrote must be visible
     # AND the palace must be fully consistent (palace_meta:main row exists,
@@ -826,12 +858,18 @@ def test_sigkilled_bootstrap_peer_recovers(isolated_namespace, palace_id):
             palace=palace, collection_name="mempalace_drawers", create=True
         )
         got = col.get(ids=["survivor-0"])
-        assert got.ids == ["survivor-0"], f"survivor row missing or wrong: {got!r}"
+        assert got.ids == ["survivor-0"], (
+            f"survivor row missing or wrong: {got!r} "
+            f"(replay with --chaos-seed {chaos_seed}, "
+            f"sigkill_delay={sigkill_delay:.6f}s)"
+        )
         # palace_meta:main must exist — that's the signal the bootstrap
         # re-run actually completed, not that we just got lucky.
         db_name = list(backend._conns.keys())[0]
         assert backend._palace_meta_present(backend._conns[db_name]), (
-            "palace_meta:main is missing after SIGKILL recovery"
+            f"palace_meta:main is missing after SIGKILL recovery "
+            f"(replay with --chaos-seed {chaos_seed}, "
+            f"sigkill_delay={sigkill_delay:.6f}s)"
         )
     finally:
         backend.close()
