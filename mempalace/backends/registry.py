@@ -14,6 +14,7 @@ name conflict (matches RFC 001 §3.2).
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 from importlib import metadata
 from threading import Lock
@@ -24,6 +25,24 @@ from .base import BaseBackend
 logger = logging.getLogger(__name__)
 
 _ENTRY_POINT_GROUP = "mempalace.backends"
+
+# Backends whose constructor / runtime path requires an optional third-party
+# package. Mapped name -> (import_module, extras_hint) so :func:`get_backend`
+# can surface a helpful install command before hitting an ImportError deep
+# inside the backend's connection path.
+_OPTIONAL_BACKEND_DEPS: dict[str, tuple[str, str]] = {
+    "surreal": ("surrealdb", 'pip install -e ".[surreal]"'),
+}
+
+
+class MissingBackendDependencyError(ImportError):
+    """Raised when the optional package for a backend is not installed.
+
+    Subclasses :class:`ImportError` so callers that already guard against
+    missing imports keep working; the message carries the exact
+    ``pip install`` incantation the user needs to run.
+    """
+
 
 _registry: dict[str, Type[BaseBackend]] = {}
 _instances: dict[str, BaseBackend] = {}
@@ -106,11 +125,32 @@ def get_backend_class(name: str) -> Type[BaseBackend]:
         raise KeyError(f"unknown backend {name!r}; available: {available_backends()}") from e
 
 
+def _check_optional_dependency(name: str) -> None:
+    """Raise :class:`MissingBackendDependencyError` if an optional dep is absent.
+
+    Keeps the error at registry-boundary level so callers get a single clear
+    install hint instead of a deep SDK import traceback the first time they
+    hit a query path.
+    """
+    spec = _OPTIONAL_BACKEND_DEPS.get(name)
+    if spec is None:
+        return
+    module, hint = spec
+    if importlib.util.find_spec(module) is None:
+        raise MissingBackendDependencyError(
+            f"backend {name!r} requires the {module!r} package; install it with: {hint}"
+        )
+
+
 def get_backend(name: str) -> BaseBackend:
     """Return a long-lived instance of the named backend.
 
     Instances are cached per-name; repeated calls return the same object.
     Call :func:`reset_backends` in tests that need isolation.
+
+    Raises :class:`KeyError` for unknown backends and
+    :class:`MissingBackendDependencyError` when a backend's optional
+    third-party package is not installed.
     """
     _discover_entry_points()
     with _lock:
@@ -120,6 +160,7 @@ def get_backend(name: str) -> BaseBackend:
         cls = _registry.get(name)
         if cls is None:
             raise KeyError(f"unknown backend {name!r}; available: {sorted(_registry.keys())}")
+        _check_optional_dependency(name)
         inst = cls()
         _instances[name] = inst
         return inst
@@ -178,12 +219,21 @@ def resolve_backend_for_palace(
 
 
 def _register_builtins() -> None:
-    """Register chroma as the in-tree default."""
+    """Register the in-tree backends (chroma default, surreal optional).
+
+    The ``surreal`` backend ships in-tree but its runtime depends on the
+    ``surrealdb`` package which is an optional extra (``pip install -e
+    ".[surreal]"``). The class itself imports lazily, so registering it
+    unconditionally is safe — the install check fires in :func:`get_backend`.
+    """
     from .chroma import ChromaBackend
+    from .surreal import SurrealBackend
 
     # Use setdefault semantics so a caller that pre-registered for tests wins.
     if "chroma" not in _registry:
         _registry["chroma"] = ChromaBackend
+    if "surreal" not in _registry:
+        _registry["surreal"] = SurrealBackend
 
 
 _register_builtins()

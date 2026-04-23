@@ -84,6 +84,8 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+DEFAULT_BACKEND = "chroma"
+SUPPORTED_BACKENDS = ("chroma", "surreal")
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -175,6 +177,35 @@ class MempalaceConfig:
     def collection_name(self):
         """ChromaDB collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
+
+    @property
+    def backend(self):
+        """Storage backend name.
+
+        Resolution order: ``MEMPALACE_BACKEND`` env var -> ``backend`` field
+        in ``~/.mempalace/config.json`` -> default (``chroma``).
+
+        Supported values:
+
+        * ``chroma`` — the in-tree ChromaDB backend (default).
+        * ``surreal`` — the in-tree SurrealDB backend. Requires
+          ``pip install -e ".[surreal]"`` and a running SurrealDB server.
+          Connection parameters come from ``MEMPALACE_SURREAL_URL``
+          (default ``http://127.0.0.1:8000``),
+          ``MEMPALACE_SURREAL_USER`` (default ``root``), and
+          ``MEMPALACE_SURREAL_PASS`` (default ``root``).
+
+        Unknown values raise :class:`ValueError` so a typo fails loud rather
+        than silently falling back to the default.
+        """
+        env_val = os.environ.get("MEMPALACE_BACKEND")
+        value = env_val or self._file_config.get("backend", DEFAULT_BACKEND)
+        value = str(value).strip().lower()
+        if value not in SUPPORTED_BACKENDS:
+            raise ValueError(
+                f"backend {value!r} is not supported; expected one of {SUPPORTED_BACKENDS}"
+            )
+        return value
 
     @property
     def people_map(self):

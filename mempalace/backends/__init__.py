@@ -10,8 +10,11 @@ Public surface:
   :class:`UnsupportedFilterError`, :class:`DimensionMismatchError`,
   :class:`EmbedderIdentityMismatchError`.
 * Registry: :func:`get_backend`, :func:`register`, :func:`available_backends`,
-  :func:`resolve_backend_for_palace`.
+  :func:`resolve_backend_for_palace`,
+  :class:`MissingBackendDependencyError`.
 * In-tree Chroma default: :class:`ChromaBackend`, :class:`ChromaCollection`.
+* In-tree optional Surreal backend: :class:`SurrealBackend`,
+  :class:`SurrealCollection` (requires ``pip install -e ".[surreal]"``).
 """
 
 from .base import (
@@ -30,6 +33,7 @@ from .base import (
 )
 from .chroma import ChromaBackend, ChromaCollection
 from .registry import (
+    MissingBackendDependencyError,
     available_backends,
     get_backend,
     get_backend_class,
@@ -38,6 +42,7 @@ from .registry import (
     resolve_backend_for_palace,
     unregister,
 )
+from .surreal import SurrealBackend, SurrealCollection
 
 __all__ = [
     "BackendClosedError",
@@ -50,9 +55,12 @@ __all__ = [
     "EmbedderIdentityMismatchError",
     "GetResult",
     "HealthStatus",
+    "MissingBackendDependencyError",
     "PalaceNotFoundError",
     "PalaceRef",
     "QueryResult",
+    "SurrealBackend",
+    "SurrealCollection",
     "UnsupportedFilterError",
     "available_backends",
     "get_backend",
