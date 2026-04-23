@@ -47,6 +47,7 @@ from threading import Lock
 from typing import Any, Optional
 
 from .base import (
+    BackendError,
     BaseBackend,
     BaseCollection,
     DimensionMismatchError,
@@ -58,6 +59,17 @@ from .base import (
     UnsupportedFilterError,
     _IncludeSpec,
 )
+
+
+class HnswIndexCreationError(BackendError):
+    """Raised when the lazy HNSW index DDL fails on first vector write.
+
+    A silent failure here means every subsequent vector query returns zero
+    rows for the life of the process — which is the opposite of the 100%
+    recall design principle. We raise and leave ``_hnsw_checked`` unset so
+    the next call retries (mp-o7v).
+    """
+
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +249,28 @@ def _bootstrap_ddl(embedding_dim: Optional[int] = None) -> str:
     ``FLEXIBLE TYPE option<object>`` for ``metadata`` — that parses as a
     syntax error in SurrealDB 3.0.4, which requires ``TYPE ... FLEXIBLE``.
     """
-    dim_field = f"{embedding_dim}" if embedding_dim is not None else "NONE"
+    # mp-hlo: only initialise ``embedding_dim`` when the caller has
+    # explicitly declared one. A caller-agnostic palace leaves this as
+    # NONE so the first real write can lock the dim atomically via the
+    # conditional UPDATE in :meth:`SurrealCollection._ensure_hnsw_index`.
+    # Pre-seeding the field (the old behaviour) meant the "WHERE
+    # embedding_dim IS NONE" guard always saw a stale 384 and silently
+    # no-op'd, which defeats the race guard.
+    if embedding_dim is not None:
+        dim_upsert = (
+            "UPSERT palace_meta:main SET "
+            f"schema_version = {_SCHEMA_VERSION}, "
+            f"embedder_name = '{_DEFAULT_EMBEDDER}', "
+            f"embedding_dim = {int(embedding_dim)}, "
+            f"hnsw_space = '{_DEFAULT_HNSW_SPACE}';"
+        )
+    else:
+        dim_upsert = (
+            "UPSERT palace_meta:main SET "
+            f"schema_version = {_SCHEMA_VERSION}, "
+            f"embedder_name = '{_DEFAULT_EMBEDDER}', "
+            f"hnsw_space = '{_DEFAULT_HNSW_SPACE}';"
+        )
     return f"""
     DEFINE TABLE IF NOT EXISTS palace_meta SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS schema_version  ON palace_meta TYPE int;
@@ -275,11 +308,7 @@ def _bootstrap_ddl(embedding_dim: Optional[int] = None) -> str:
     DEFINE INDEX IF NOT EXISTS closet_ft     ON closet FIELDS document
         FULLTEXT ANALYZER mp_text BM25(1.2, 0.75) HIGHLIGHTS;
 
-    UPSERT palace_meta:main SET
-        schema_version = {_SCHEMA_VERSION},
-        embedder_name  = '{_DEFAULT_EMBEDDER}',
-        embedding_dim  = {dim_field},
-        hnsw_space     = '{_DEFAULT_HNSW_SPACE}';
+    {dim_upsert}
     """
 
 
@@ -338,33 +367,74 @@ class SurrealCollection(BaseCollection):
         return self._RecordID(self._table, ext_id)
 
     def _ensure_hnsw_index(self, observed_dim: int) -> None:
-        """Create the HNSW index on first embedding write (mp-j19).
+        """Create the HNSW index on first embedding write (mp-j19, mp-o7v, mp-hlo).
 
         SurrealDB 3.0.4 DEFINE INDEX with HNSW bakes the dimension into the
         index and silently drops mismatched writes, so we defer creation
         until we see a real vector. On subsequent calls, the index already
         exists and the ``IF NOT EXISTS`` guard makes this a no-op.
 
-        The dim is also written back to ``palace_meta:main.embedding_dim``
-        so :meth:`_expected_embedding_dim` can enforce
-        ``DimensionMismatchError`` on query.
+        The dim is locked into ``palace_meta:main.embedding_dim`` using a
+        conditional SET (only writes when the field is still ``NONE``) so
+        two racing writers cannot install conflicting dims (mp-hlo). After
+        the conditional write we SELECT the stored dim back: if it differs
+        from our observation, the loser raises
+        :class:`DimensionMismatchError`.
+
+        DDL failure raises :class:`HnswIndexCreationError` and leaves
+        ``_hnsw_checked`` unset so the next call retries — silent swallow
+        here (the old behaviour) violates the 100% recall principle by
+        turning every subsequent vector query into a zero-row return
+        (mp-o7v).
         """
         if self._hnsw_checked:
             return
         index_name = f"{self._table}_vec"
+        observed = int(observed_dim)
+
+        # Race-free dim lock (mp-hlo): only set embedding_dim when it is
+        # still NONE. Concurrent writers with different dims will observe
+        # the winner's value on read-back and raise DimensionMismatchError.
+        try:
+            self._db.query(
+                "UPDATE palace_meta:main SET embedding_dim = $d WHERE embedding_dim IS NONE;",
+                {"d": observed},
+            )
+            rows = self._db.query("SELECT embedding_dim FROM palace_meta:main;")
+        except Exception as e:
+            raise HnswIndexCreationError(
+                f"failed to lock embedding_dim for {self._table!r}: {e}"
+            ) from e
+
+        stored_dim: Optional[int] = None
+        if rows:
+            row = rows[0] if isinstance(rows, list) else rows
+            if isinstance(row, dict) and isinstance(row.get("embedding_dim"), int):
+                stored_dim = row["embedding_dim"]
+        if stored_dim is not None and stored_dim != observed:
+            # Do NOT set _hnsw_checked — the caller's write is invalid but
+            # the process is free to retry with the correct dim.
+            raise DimensionMismatchError(
+                f"palace embedding_dim is {stored_dim} but write uses dim {observed}"
+            )
+
+        # Define the HNSW index itself. IF NOT EXISTS makes this idempotent
+        # across concurrent first-writers; the dim baked in by the winner
+        # wins, and because we already agreed on `observed == stored_dim`
+        # both processes pass through cleanly.
         ddl = (
             f"DEFINE INDEX IF NOT EXISTS {index_name} ON {self._table} "
-            f"FIELDS embedding HNSW DIMENSION {observed_dim} "
+            f"FIELDS embedding HNSW DIMENSION {observed} "
             f"DIST COSINE M 16 EFC 150;"
         )
         try:
             self._db.query(ddl)
-            self._db.query(
-                "UPSERT palace_meta:main SET embedding_dim = $d;",
-                {"d": int(observed_dim)},
-            )
-        except Exception:
-            logger.exception("failed to create HNSW index %s", index_name)
+        except Exception as e:
+            # Silent swallow here means every vector query returns zero
+            # rows for the life of this process. Raise instead so the
+            # caller can retry or fail fast (mp-o7v).
+            raise HnswIndexCreationError(f"failed to create HNSW index {index_name!r}: {e}") from e
+
         self._hnsw_checked = True
 
     def _record_payload(
@@ -388,14 +458,54 @@ class SurrealCollection(BaseCollection):
     # Writes
     # ------------------------------------------------------------------
 
+    def _enforce_write_dims(self, embeddings: Optional[list[list[float]]]) -> Optional[int]:
+        """Reject writes whose embedding length does not match the locked dim.
+
+        Chroma raises ``DimensionMismatchError`` when a wrong-dim vector is
+        added after the collection has seen its first embedding; Surreal's
+        HNSW silently drops the row, which is the opposite of the 100%
+        recall contract. Check *before* any write lands in Surreal (mp-s58).
+
+        Returns the dim of the first non-empty embedding in ``embeddings``,
+        so callers can chain into :meth:`_ensure_hnsw_index`. Returns
+        ``None`` when the payload has no vectors at all.
+        """
+        if not embeddings:
+            return None
+        first_dim: Optional[int] = None
+        for i, emb in enumerate(embeddings):
+            if emb is None:
+                continue
+            # Surreal stores lists; reject ragged payloads eagerly.
+            if not isinstance(emb, (list, tuple)):
+                raise DimensionMismatchError(
+                    f"embedding {i} is not a list/tuple (got {type(emb).__name__})"
+                )
+            if not emb:
+                continue
+            if first_dim is None:
+                first_dim = len(emb)
+            elif len(emb) != first_dim:
+                # Ragged within a single call — reject before hitting DB.
+                raise DimensionMismatchError(
+                    f"embedding {i} has length {len(emb)} but batch dim is {first_dim}"
+                )
+        if first_dim is None:
+            return None
+        expected = self._expected_embedding_dim()
+        if expected is not None and first_dim != expected:
+            raise DimensionMismatchError(
+                f"embedding dim {first_dim} does not match palace embedding_dim {expected}"
+            )
+        return first_dim
+
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_writes(documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings)
-        # Lazy-create the HNSW index using the first non-empty embedding's
-        # dimension (mp-j19) — Surreal bakes the dim into DEFINE INDEX.
-        if embeddings:
-            first = next((e for e in embeddings if e), None)
-            if first is not None:
-                self._ensure_hnsw_index(len(first))
+        # Reject dim-mismatched writes BEFORE they hit Surreal (mp-s58) and
+        # lazy-create the HNSW index using the observed dim (mp-j19).
+        observed = self._enforce_write_dims(embeddings)
+        if observed is not None:
+            self._ensure_hnsw_index(observed)
         for i, ext_id in enumerate(ids):
             payload = self._record_payload(
                 ext_id=ext_id,
@@ -411,10 +521,9 @@ class SurrealCollection(BaseCollection):
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_writes(documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings)
-        if embeddings:
-            first = next((e for e in embeddings if e), None)
-            if first is not None:
-                self._ensure_hnsw_index(len(first))
+        observed = self._enforce_write_dims(embeddings)
+        if observed is not None:
+            self._ensure_hnsw_index(observed)
         for i, ext_id in enumerate(ids):
             payload = self._record_payload(
                 ext_id=ext_id,
@@ -425,6 +534,14 @@ class SurrealCollection(BaseCollection):
             result = self._db.upsert(self._rid(ext_id), payload)
             _raise_if_sdk_error(result, f"upsert id={ext_id!r}")
 
+    # Max retries for the optimistic concurrency loop in :meth:`update`
+    # (mp-93e). SurrealDB 3.0.4 uses MVCC without compare-and-swap; two
+    # concurrent updates to the same record can race with last-writer-
+    # wins. Retrying a server-side MERGE after a lost-write detection
+    # closes the gap without needing a row-level lock the engine does
+    # not expose.
+    _UPDATE_MAX_RETRIES = 8
+
     def update(
         self,
         *,
@@ -433,10 +550,23 @@ class SurrealCollection(BaseCollection):
         metadatas=None,
         embeddings=None,
     ):
-        """Atomic per-id merge update.
+        """Atomic per-id merge update (mp-93e).
 
-        Surreal's ``MERGE`` preserves fields that were not passed, so this is
-        cheaper and race-free vs. the base ``update`` (get + merge + upsert).
+        The merge lands in a single server-side statement —
+        ``UPDATE $rid MERGE { metadata: $patch, ... }`` — so the
+        client never round-trips a SELECT-then-MERGE (which the old
+        implementation did, and which could lose an entire writer's
+        keys under contention).
+
+        SurrealDB 3.0.4's storage engine is optimistic-MVCC with no
+        CAS primitive, so two concurrent MERGEs can still race and
+        one writer's keys may disappear on the first attempt. To
+        guarantee the merge is effectively atomic at the user-visible
+        level we add a read-after-write verification and retry loop
+        bounded by ``_UPDATE_MAX_RETRIES``. A retry is only issued
+        when a key the caller just wrote is missing from the stored
+        metadata — a true lost-update — so unrelated concurrent writes
+        that happen to overlap on a different key set never retry.
         """
         if documents is None and metadatas is None and embeddings is None:
             raise ValueError("update requires at least one of documents, metadatas, embeddings")
@@ -449,24 +579,90 @@ class SurrealCollection(BaseCollection):
             if value is not None and len(value) != n:
                 raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
 
+        # Pre-validate embedding dims the same way add/upsert do (mp-s58),
+        # so partial updates cannot slip a wrong-dim vector past the lock.
+        if embeddings is not None:
+            self._enforce_write_dims(embeddings)
+
         for i, ext_id in enumerate(ids):
-            patch: dict[str, Any] = {}
-            if documents is not None:
-                patch["document"] = documents[i]
-            if metadatas is not None:
-                # Merge into the stored metadata dict, matching the base-class
-                # semantics (keys not passed survive).
-                existing = self._db.select(self._rid(ext_id))
-                current_meta: dict = {}
-                if existing:
-                    row = existing[0] if isinstance(existing, list) else existing
-                    current_meta = dict(row.get("metadata") or {})
-                current_meta.update(metadatas[i] or {})
-                patch["metadata"] = current_meta
-            if embeddings is not None:
-                patch["embedding"] = list(embeddings[i])
-            if patch:
-                self._db.merge(self._rid(ext_id), patch)
+            meta_patch = dict(metadatas[i] or {}) if metadatas is not None else None
+            doc = documents[i] if documents is not None else None
+            emb = list(embeddings[i]) if embeddings is not None else None
+            self._update_one(ext_id, doc, meta_patch, emb)
+
+    def _update_one(
+        self,
+        ext_id: str,
+        document: Optional[str],
+        metadata_patch: Optional[dict],
+        embedding: Optional[list[float]],
+    ) -> None:
+        """Apply one MERGE-style update, retrying on MVCC lost-updates (mp-93e).
+
+        The merge payload is a single ``{metadata, document, embedding}``
+        dict passed via ``UPDATE $rid MERGE $m``. For metadata specifically,
+        SurrealDB's ``MERGE`` operator deep-merges caller keys into the
+        stored object — so the statement is itself atomic — but since the
+        engine cannot CAS against a version, a concurrent MERGE on the
+        same record can still overwrite us. We detect that by re-reading
+        and re-issuing until the caller's keys are visible (bounded by
+        :attr:`_UPDATE_MAX_RETRIES`).
+        """
+        merge_payload: dict[str, Any] = {}
+        if document is not None:
+            merge_payload["document"] = document
+        if metadata_patch is not None:
+            merge_payload["metadata"] = metadata_patch
+        if embedding is not None:
+            merge_payload["embedding"] = embedding
+        if not merge_payload:
+            return
+
+        rid = self._rid(ext_id)
+        patch_keys = set(metadata_patch.keys()) if metadata_patch else set()
+
+        for attempt in range(self._UPDATE_MAX_RETRIES):
+            # Single server-side MERGE — no client-side SELECT-then-MERGE
+            # round trip. Chroma's UPDATE call is analogous: one shot to
+            # the storage engine with the caller's patch.
+            self._db.query(
+                "UPDATE $rid MERGE $m;",
+                {"rid": rid, "m": merge_payload},
+            )
+            if not patch_keys:
+                # No metadata merge semantics to verify — single statement
+                # is sufficient for document / embedding writes.
+                return
+
+            # Verify the metadata merge landed. A concurrent writer's
+            # MERGE can race ours (MVCC, no CAS) and we may find our keys
+            # missing even though the statement returned cleanly.
+            existing = self._db.select(rid)
+            if existing is None:
+                return
+            row = existing[0] if isinstance(existing, list) else existing
+            stored_meta = dict(row.get("metadata") or {}) if isinstance(row, dict) else {}
+            all_present = all(
+                stored_meta.get(k) == metadata_patch[k]  # type: ignore[index]
+                for k in patch_keys
+            )
+            if all_present:
+                return
+            # Lost update detected — loop and retry the MERGE. Because
+            # MERGE is additive, retrying is safe even if the other
+            # writer's keys are now interleaved with ours.
+            logger.debug(
+                "mp-93e retry %d for id=%r: keys %r not visible after MERGE",
+                attempt + 1,
+                ext_id,
+                [k for k in patch_keys if stored_meta.get(k) != metadata_patch[k]],  # type: ignore[index]
+            )
+        # Exhausted retries — surface a clear error so the caller sees
+        # the race rather than a silent lost-write.
+        raise BackendError(
+            f"update for id={ext_id!r} could not durably land metadata keys "
+            f"{sorted(patch_keys)} after {self._UPDATE_MAX_RETRIES} retries"
+        )
 
     # ------------------------------------------------------------------
     # Reads
@@ -538,9 +734,27 @@ class SurrealCollection(BaseCollection):
             search_term = where_document["$search"]
             # Any other keys become AND'd where filters.
             extra_wd = {k: v for k, v in where_document.items() if k != "$search"}
-            return self._bm25_query(
+            # mp-15y: callers pass the explicit BM25 phrase via
+            # ``$search`` and use ``query_texts`` to shape the outer
+            # dimension. Chroma runs one independent search per
+            # ``query_texts`` element; to match that, treat the value of
+            # ``$search`` as a template. A single string applies to every
+            # outer query (legacy behaviour). A list must match
+            # ``len(query_texts)`` so each outer row gets its own
+            # BM25 ranking rather than a broadcasted copy.
+            if isinstance(search_term, list):
+                if len(search_term) != len(query_texts):
+                    raise UnsupportedFilterError(
+                        "where_document={'$search': [...]} length "
+                        f"{len(search_term)} must match query_texts length "
+                        f"{len(query_texts)} (one search term per query)"
+                    )
+                terms = [str(t) for t in search_term]
+            else:
+                terms = [str(search_term)] * len(query_texts)
+            return self._bm25_query_multi(
                 query_texts=query_texts,
-                search_term=search_term,
+                search_terms=terms,
                 n_results=n_results,
                 where=where,
                 where_document=extra_wd or None,
@@ -692,28 +906,33 @@ class SurrealCollection(BaseCollection):
             rows = [rows]
         return [r for r in rows if isinstance(r, dict)]
 
-    def _bm25_query(
+    def _bm25_query_multi(
         self,
         *,
         query_texts: list[str],
-        search_term: str,
+        search_terms: list[str],
         n_results: int,
         where: Optional[dict],
         where_document: Optional[dict],
         spec: _IncludeSpec,
     ) -> QueryResult:
-        """Run a BM25 query across the FULLTEXT index.
+        """Run one independent BM25 query per element of ``query_texts`` (mp-15y).
 
-        ``search_term`` is the literal token string passed to the
-        ``document @0@ $term`` operator. The BM25 score is turned into a
+        The old implementation ran a single BM25 query and broadcast the
+        same row set across every outer row, which meant a caller passing
+        ``query_texts=["foo", "bar"]`` saw identical rankings for both — a
+        correctness bug when the two queries have different best matches.
+        Chroma's behaviour is one independent ranking per outer element;
+        this helper matches that by looping.
+
+        Each ``search_terms[i]`` is the literal phrase passed to
+        ``document @0@ $term`` for query ``i``. BM25 score ->
         pseudo-distance ``1 / (1 + score)`` so ``searcher.py``'s
         ``similarity = 1 - distance`` convention keeps producing sensible
-        numbers: a higher BM25 score -> lower pseudo-distance -> higher
-        similarity. The outer shape still honors ``len(query_texts)`` so
-        batched callers get the right number of result rows — each batch
-        element runs the same BM25 search (this matches Chroma's broadcast
-        when multiple query_texts share the same DB).
+        numbers (higher score -> lower pseudo-distance -> higher sim).
         """
+        assert len(search_terms) == len(query_texts)
+
         select_fields = [
             "id_ext",
             "search::score(0) AS _score",
@@ -725,67 +944,68 @@ class SurrealCollection(BaseCollection):
         if spec.embeddings:
             select_fields.append("embedding")
 
-        filter_clause, bindings = self._build_filter_clause(
-            where=where, where_document=where_document
-        )
-        bindings["term"] = search_term
-        bindings["k"] = int(n_results)
-
-        q = f"SELECT {', '.join(select_fields)} FROM {self._table} WHERE document @0@ $term"
-        if filter_clause:
-            q += f" AND {filter_clause}"
-        q += " ORDER BY _score DESC LIMIT $k"
-
-        try:
-            rows = self._db.query(q, bindings)
-        except Exception as e:
-            logger.warning("BM25 query failed, returning empty: %s", e)
-            rows = []
-        if rows is None:
-            rows = []
-        if not isinstance(rows, list):
-            rows = [rows]
-        rows = [r for r in rows if isinstance(r, dict)]
-
-        # Convert BM25 score -> pseudo-distance (searcher.py expects cosine-
-        # like 0..N distance). Using ``1 / (1 + score)`` keeps it in (0, 1]
-        # where 1.0 = no match and distances strictly decrease with score.
-        def _score_to_dist(row):
+        def _score_to_dist(row: dict) -> float:
             s = row.get("_score") or 0.0
             return 1.0 / (1.0 + float(s))
 
-        ids_i: list[str] = []
-        docs_i: list[str] = []
-        metas_i: list[dict] = []
-        dists_i: list[float] = []
-        embs_i: list[list[float]] = []
-        for row in rows:
-            ids_i.append(row.get("id_ext") or "")
-            if spec.documents:
-                docs_i.append(row.get("document") or "")
-            if spec.metadatas:
-                metas_i.append(dict(row.get("metadata") or {}))
-            if spec.distances:
-                dists_i.append(_score_to_dist(row))
-            if spec.embeddings:
-                emb = row.get("embedding")
-                embs_i.append(list(emb) if emb is not None else [])
+        out_ids: list[list[str]] = []
+        out_docs: list[list[str]] = []
+        out_metas: list[list[dict]] = []
+        out_dists: list[list[float]] = []
+        out_embeds: list[list[list[float]]] = []
 
-        # Broadcast across the outer query dim — same rows, one copy per
-        # query_text. Chroma does the same shape when the callers share DB.
+        for term in search_terms:
+            filter_clause, bindings = self._build_filter_clause(
+                where=where, where_document=where_document
+            )
+            bindings["term"] = term
+            bindings["k"] = int(n_results)
+
+            q = f"SELECT {', '.join(select_fields)} FROM {self._table} WHERE document @0@ $term"
+            if filter_clause:
+                q += f" AND {filter_clause}"
+            q += " ORDER BY _score DESC LIMIT $k"
+
+            try:
+                rows = self._db.query(q, bindings)
+            except Exception as e:
+                logger.warning("BM25 query failed, returning empty: %s", e)
+                rows = []
+            if rows is None:
+                rows = []
+            if not isinstance(rows, list):
+                rows = [rows]
+            rows = [r for r in rows if isinstance(r, dict)]
+
+            ids_i: list[str] = []
+            docs_i: list[str] = []
+            metas_i: list[dict] = []
+            dists_i: list[float] = []
+            embs_i: list[list[float]] = []
+            for row in rows:
+                ids_i.append(row.get("id_ext") or "")
+                if spec.documents:
+                    docs_i.append(row.get("document") or "")
+                if spec.metadatas:
+                    metas_i.append(dict(row.get("metadata") or {}))
+                if spec.distances:
+                    dists_i.append(_score_to_dist(row))
+                if spec.embeddings:
+                    emb = row.get("embedding")
+                    embs_i.append(list(emb) if emb is not None else [])
+            out_ids.append(ids_i)
+            out_docs.append(docs_i)
+            out_metas.append(metas_i)
+            out_dists.append(dists_i)
+            out_embeds.append(embs_i)
+
         n = len(query_texts)
         return QueryResult(
-            ids=[list(ids_i) for _ in range(n)],
-            documents=[list(docs_i) for _ in range(n)]
-            if spec.documents
-            else [[] for _ in range(n)],
-            metadatas=(
-                [list(metas_i) for _ in range(n)] if spec.metadatas else [[] for _ in range(n)]
-            ),
-            distances=(
-                [list(dists_i) for _ in range(n)] if spec.distances else [[] for _ in range(n)]
-            ),
-            embeddings=[list(embs_i) for _ in range(n)] if spec.embeddings else None,
+            ids=out_ids,
+            documents=out_docs if spec.documents else [[] for _ in range(n)],
+            metadatas=out_metas if spec.metadatas else [[] for _ in range(n)],
+            distances=out_dists if spec.distances else [[] for _ in range(n)],
+            embeddings=out_embeds if spec.embeddings else None,
         )
 
     def _split_rows(
@@ -1155,15 +1375,17 @@ class SurrealBackend(BaseBackend):
         self,
         db_name: str,
         conn,
-        embedding_dim: int = _DEFAULT_EMBEDDING_DIM,
+        embedding_dim: Optional[int] = None,
     ) -> None:
         """Apply schema DDL once per (palace, process). Idempotent on Surreal.
 
-        ``embedding_dim`` is baked into the HNSW index definition and the
-        ``palace_meta:main`` row. The dimension is fixed for the lifetime of
-        the palace — re-bootstrap with a different dim after data exists will
-        leave the HNSW index inconsistent and is a caller error (RFC 001
-        ``DimensionMismatchError`` territory).
+        When ``embedding_dim`` is ``None`` (the default), ``palace_meta:main``
+        is created with ``embedding_dim`` left unset so the first real write
+        can lock the dim atomically via the race-free conditional UPDATE
+        (mp-hlo). Passing an explicit dim — e.g. from
+        ``options={"embedding_dim": ...}`` — pre-seeds the field; subsequent
+        writes with a different dim raise
+        :class:`DimensionMismatchError`.
         """
         with self._lock:
             tables = self._bootstrapped.setdefault(db_name, set())
@@ -1203,9 +1425,12 @@ class SurrealBackend(BaseBackend):
             raise PalaceNotFoundError(f"surreal palace {db_name!r} has no drawer/closet tables")
 
         if create:
-            embedding_dim = _DEFAULT_EMBEDDING_DIM
-            if options and isinstance(options, dict):
-                embedding_dim = int(options.get("embedding_dim", embedding_dim))
+            # Only pre-seed embedding_dim when the caller explicitly asks
+            # for one — otherwise leave it NONE so first-write locks the
+            # dim atomically (mp-hlo).
+            embedding_dim: Optional[int] = None
+            if options and isinstance(options, dict) and "embedding_dim" in options:
+                embedding_dim = int(options["embedding_dim"])
             self._ensure_bootstrap(db_name, conn, embedding_dim=embedding_dim)
 
         return SurrealCollection(conn, table)

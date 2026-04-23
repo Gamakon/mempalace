@@ -630,3 +630,265 @@ def test_detect_always_false():
     from mempalace.backends.surreal import SurrealBackend
 
     assert SurrealBackend.detect("/tmp/any/path") is False
+
+
+# ---------------------------------------------------------------------------
+# P0 regression guards — mp-o7v, mp-s58, mp-hlo, mp-93e, mp-15y
+# ---------------------------------------------------------------------------
+
+
+def test_hnsw_ddl_failure_raises_and_retries(drawer_collection, monkeypatch):
+    """mp-o7v: HNSW DDL failure MUST raise, not silently swallow.
+
+    Silent swallow turns every subsequent vector query into a zero-row
+    result for the life of the process — the opposite of the 100% recall
+    principle. The fix raises :class:`HnswIndexCreationError` and leaves
+    ``_hnsw_checked`` unset so the next call retries.
+    """
+    from mempalace.backends.surreal import HnswIndexCreationError
+
+    real_query = drawer_collection._db.query
+    call_state = {"fail_ddl": True}
+
+    def fake_query(stmt, *args, **kwargs):
+        # Only fail the DEFINE INDEX ... HNSW statement; everything else
+        # (palace_meta updates, SELECTs) passes through so the test can
+        # exercise the actual DDL-failure branch.
+        if "DEFINE INDEX" in stmt and "HNSW" in stmt and call_state["fail_ddl"]:
+            raise RuntimeError("simulated DDL failure")
+        return real_query(stmt, *args, **kwargs)
+
+    monkeypatch.setattr(drawer_collection._db, "query", fake_query)
+
+    with pytest.raises(HnswIndexCreationError):
+        drawer_collection.add(
+            documents=["x"],
+            ids=["a"],
+            embeddings=[[0.1, 0.2, 0.3]],
+        )
+    # Flag stays False so the next call retries — critical for recall.
+    assert drawer_collection._hnsw_checked is False
+
+    # Stop forcing the failure; retry should succeed cleanly.
+    call_state["fail_ddl"] = False
+    drawer_collection.add(
+        documents=["x"],
+        ids=["a"],
+        embeddings=[[0.1, 0.2, 0.3]],
+    )
+    assert drawer_collection._hnsw_checked is True
+
+
+def test_add_wrong_dim_after_lock_raises_dimension_mismatch(drawer_collection):
+    """mp-s58: add() must reject wrong-dim vectors once dim is locked."""
+    # Lock dim at 3.
+    drawer_collection.add(
+        documents=["first"],
+        ids=["id1"],
+        embeddings=[[0.1, 0.2, 0.3]],
+    )
+    # Wrong dim on a subsequent add must raise BEFORE hitting Surreal —
+    # otherwise HNSW silently drops the row and recall is broken.
+    with pytest.raises(DimensionMismatchError):
+        drawer_collection.add(
+            documents=["bad"],
+            ids=["id2"],
+            embeddings=[[0.1, 0.2]],  # dim 2 != locked 3
+        )
+    # Also enforced on upsert.
+    with pytest.raises(DimensionMismatchError):
+        drawer_collection.upsert(
+            documents=["bad"],
+            ids=["id3"],
+            embeddings=[[0.1, 0.2, 0.3, 0.4]],  # dim 4
+        )
+    # And update(embeddings=...) too.
+    with pytest.raises(DimensionMismatchError):
+        drawer_collection.update(
+            ids=["id1"],
+            embeddings=[[0.5, 0.6]],
+        )
+
+
+def test_concurrent_first_write_dim_lock_race(surreal_backend, palace_ref):
+    """mp-hlo: two processes racing to lock the embedding_dim — one wins.
+
+    Using threads here instead of processes since the SDK is blocking and
+    the race hits the same Surreal database. The conditional UPDATE
+    ``SET embedding_dim = $d WHERE embedding_dim IS NONE`` serialises at
+    the DB level so exactly one dim sticks; the loser observes the
+    stored dim and raises :class:`DimensionMismatchError`.
+    """
+    import threading
+
+    col = surreal_backend.get_collection(
+        palace=palace_ref, collection_name="mempalace_drawers", create=True
+    )
+    # Fresh collection — dim must still be unlocked.
+    assert col._expected_embedding_dim() is None
+
+    # Two collection instances racing a first-write. We use the same
+    # underlying connection (single-threaded http) but independent
+    # collection wrappers so each has its own ``_hnsw_checked`` flag.
+    from mempalace.backends.surreal import SurrealCollection
+
+    col_a = SurrealCollection(col._db, col._table)
+    col_b = SurrealCollection(col._db, col._table)
+
+    barrier = threading.Barrier(2)
+    results: dict[str, Exception | None] = {"a": None, "b": None}
+
+    def writer(which: str, collection, dim: int):
+        barrier.wait()
+        try:
+            collection.add(
+                documents=[f"doc-{which}"],
+                ids=[f"id-{which}"],
+                embeddings=[[0.1] * dim],
+            )
+        except Exception as e:
+            results[which] = e
+
+    t1 = threading.Thread(target=writer, args=("a", col_a, 3))
+    t2 = threading.Thread(target=writer, args=("b", col_b, 5))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Exactly one writer should have failed with DimensionMismatchError.
+    errors = [(k, v) for k, v in results.items() if v is not None]
+    successes = [k for k, v in results.items() if v is None]
+    assert len(errors) == 1, f"expected one failure, got results={results}"
+    assert len(successes) == 1
+    _, err = errors[0]
+    assert isinstance(err, DimensionMismatchError), f"wrong exception type: {err!r}"
+
+    # Winner's dim is durably stored; further writes at that dim succeed,
+    # and at the loser's dim still fail.
+    locked = col._expected_embedding_dim()
+    assert locked in (3, 5)
+    with pytest.raises(DimensionMismatchError):
+        col.add(
+            documents=["dim-mismatch"],
+            ids=["late"],
+            embeddings=[[0.2] * (3 if locked == 5 else 5)],
+        )
+
+
+def test_concurrent_metadata_updates_both_visible(surreal_backend, palace_ref):
+    """mp-93e: concurrent metadata updates must both land — no lost writes.
+
+    The old implementation SELECTed, merged in Python, then MERGEd back,
+    so two writers racing the same record could each observe the same
+    pre-image and clobber each other. The fix pushes the merge into one
+    SurrealQL ``UPDATE ... SET metadata = object::extend(...)`` statement
+    so the merge is server-side and per-record atomic.
+
+    We use two independent backend instances (each with its own
+    SurrealDB connection) to get genuine server-side concurrency — the
+    blocking-HTTP SDK is not thread-safe across a single connection, so
+    driving the race through separate connections is the accurate shape
+    of "two processes racing" in production.
+    """
+    import threading
+
+    from mempalace.backends.surreal import SurrealBackend
+
+    ns = os.environ.get("MEMPALACE_SURREAL_NS")
+    backend_a = SurrealBackend(namespace=ns)
+    backend_b = SurrealBackend(namespace=ns)
+    try:
+        col_a = backend_a.get_collection(
+            palace=palace_ref, collection_name="mempalace_drawers", create=True
+        )
+        col_b = backend_b.get_collection(
+            palace=palace_ref, collection_name="mempalace_drawers", create=True
+        )
+
+        # Seed the row via one of the collections.
+        col_a.add(documents=["seed"], ids=["row"], metadatas=[{"k0": 0}])
+
+        errors: list[Exception] = []
+        barrier = threading.Barrier(2)
+
+        def writer(collection, patch):
+            barrier.wait()
+            try:
+                collection.update(ids=["row"], metadatas=[patch])
+            except Exception as e:  # pragma: no cover - surface any race crash
+                errors.append(e)
+
+        # Repeat a handful of times — if the merge is truly atomic we
+        # never lose a key; the SELECT-then-MERGE racer loses keys
+        # probabilistically and fails reliably within a few iterations.
+        for i in range(5):
+            col_a.update(ids=["row"], metadatas=[{"from_a": None, "from_b": None}])
+            t1 = threading.Thread(target=writer, args=(col_a, {"from_a": f"A{i}"}))
+            t2 = threading.Thread(target=writer, args=(col_b, {"from_b": f"B{i}"}))
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+            assert not errors, f"concurrent update raised: {errors}"
+
+            r = col_a.get(ids=["row"])
+            meta = r.metadatas[0]
+            assert meta.get("from_a") == f"A{i}", f"iter {i}: lost writer A's key: {meta!r}"
+            assert meta.get("from_b") == f"B{i}", f"iter {i}: lost writer B's key: {meta!r}"
+            # Seed key survives every iteration.
+            assert meta.get("k0") == 0, f"iter {i}: lost seed key: {meta!r}"
+    finally:
+        backend_a.close()
+        backend_b.close()
+
+
+def test_bm25_multi_query_per_term_ranking(drawer_collection):
+    """mp-15y: multi-element query_texts with $search must rank per-query.
+
+    The old implementation ran a single BM25 query and broadcast the
+    same row set across every outer element. That's wrong whenever the
+    two queries target different best matches. The fix accepts a list of
+    terms and loops one independent search per outer element — matching
+    Chroma's per-query behaviour.
+    """
+    # Seed so each term has a distinct top hit.
+    drawer_collection.add(
+        documents=[
+            "alpha wolf runs through forests at dawn",
+            "beta cat watches birds from windowsills",
+            "gamma fox burrows into leaf piles",
+            "delta mouse scurries beneath floorboards",
+        ],
+        ids=["w1", "w2", "w3", "w4"],
+        embeddings=[[0.1, 0.2, 0.3]] * 4,
+    )
+    result = drawer_collection.query(
+        query_texts=["wolf", "cat"],
+        where_document={"$search": ["wolf", "cat"]},
+        n_results=3,
+    )
+    # Two independent rankings — not a broadcast of the same row set.
+    assert len(result.ids) == 2
+    # First query ranks "wolf" hit first; second ranks "cat" hit first.
+    assert result.ids[0][0] == "w1", f"query 0 (wolf) wrong top: {result.ids[0]}"
+    assert result.ids[1][0] == "w2", f"query 1 (cat) wrong top: {result.ids[1]}"
+    # Confirm the two rankings differ — proves per-query execution.
+    assert result.ids[0] != result.ids[1] or (result.distances[0] != result.distances[1]), (
+        "per-query rankings must not be a simple broadcast"
+    )
+
+
+def test_bm25_multi_query_length_mismatch_raises(drawer_collection):
+    """mp-15y: list-form $search must match len(query_texts) or raise."""
+    drawer_collection.add(
+        documents=["foo bar baz"],
+        ids=["only"],
+        embeddings=[[0.1, 0.2, 0.3]],
+    )
+    with pytest.raises(UnsupportedFilterError):
+        drawer_collection.query(
+            query_texts=["foo", "bar"],
+            where_document={"$search": ["foo"]},  # len 1 vs 2
+            n_results=3,
+        )
