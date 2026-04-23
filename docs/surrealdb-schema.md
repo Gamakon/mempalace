@@ -164,8 +164,8 @@ DEFINE INDEX closet_vec ON closet FIELDS embedding HNSW DIMENSION 384 DIST COSIN
 
 -- Full-text / BM25 — replaces the $contains fast-path Chroma advertises
 DEFINE ANALYZER mp_text TOKENIZERS blank, class FILTERS lowercase, ascii, snowball(english);
-DEFINE INDEX drawer_ft  ON drawer FIELDS document SEARCH ANALYZER mp_text BM25 HIGHLIGHTS;
-DEFINE INDEX closet_ft  ON closet FIELDS document SEARCH ANALYZER mp_text BM25 HIGHLIGHTS;
+DEFINE INDEX drawer_ft  ON drawer FIELDS document FULLTEXT ANALYZER mp_text BM25 HIGHLIGHTS;
+DEFINE INDEX closet_ft  ON closet FIELDS document FULLTEXT ANALYZER mp_text BM25 HIGHLIGHTS;
 
 -- Metadata filters (RFC 001 `where=` equality path — the where a user hits most)
 DEFINE INDEX drawer_wing_room ON drawer FIELDS wing, room;
@@ -231,3 +231,4 @@ This schema has been real-world tested: the fixes below landed after implementin
 - **mp-5js — duplicate `drawer.embedding`.** The original doc defined `drawer.embedding` twice; the second (with the `array::len` ASSERT against `palace_meta:main.embedding_dim`) is the correct one. Duplicate removed.
 - **mp-m1z — `DEFAULT time::now()` does not survive `UPSERT CONTENT`.** The second UPSERT fails with "Expected `datetime` but found `NONE`" because `UPSERT CONTENT` overlays the incoming object and DEFAULT is only evaluated on CREATE. The working pattern is `VALUE $value OR time::now() DEFAULT time::now()` — the `VALUE` clause re-fills on every write. Applied to every `*_at` datetime field (drawer, wing, room, entity, triple, palace_meta).
 - **mp-7wg — `valid_from` / `valid_to` retyped to `option<string>`.** Callers (the KG port in `kg_surreal.py`, matching the existing SQLite semantics of `knowledge_graph.py`) pass plain ISO date strings like `"2015-04-01"`, not Surreal `d'...'` datetime literals. Typing as `datetime` forced every call site to emit the `d'...'` prefix and made SCHEMALESS the only escape hatch. Typing as `option<string>` keeps SCHEMAFULL and matches caller reality; ISO 8601 strings sort lexicographically so the temporal validity range query still works as-is.
+- **mp-0gy — `DEFINE INDEX ... FULLTEXT ANALYZER`, not `SEARCH ANALYZER`.** SurrealDB 3.0.4 rejects the `SEARCH ANALYZER` keyword at parse time; the working form is `FULLTEXT ANALYZER mp_text BM25 HIGHLIGHTS` (confirmed by the mp-j19 implementation). Applied to `drawer_ft` and `closet_ft`.
