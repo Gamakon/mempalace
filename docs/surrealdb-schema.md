@@ -34,8 +34,7 @@ DEFINE TABLE drawer SCHEMAFULL PERMISSIONS NONE;
 
 DEFINE FIELD id_ext          ON drawer TYPE string;            -- legacy Chroma id (e.g. "drawer_<wing>_<room>_<sha>")
 DEFINE FIELD document        ON drawer TYPE string ASSERT $value != NONE;  -- verbatim text
-DEFINE FIELD embedding       ON drawer TYPE array<float>;      -- dim = palace_meta.embedding_dim (default 384, all-MiniLM-L6-v2)
-DEFINE FIELD embedding       ON drawer TYPE array<float> ASSERT array::len($value) = palace_meta:main.embedding_dim;
+DEFINE FIELD embedding       ON drawer TYPE array<float> ASSERT array::len($value) = palace_meta:main.embedding_dim;  -- dim locked to palace_meta.embedding_dim (default 384, all-MiniLM-L6-v2)
 
 -- structural pointers
 DEFINE FIELD wing            ON drawer TYPE record<wing>;
@@ -47,12 +46,12 @@ DEFINE FIELD chunk_index     ON drawer TYPE int;
 DEFINE FIELD source_file     ON drawer TYPE option<string>;
 DEFINE FIELD source_mtime    ON drawer TYPE option<float>;
 DEFINE FIELD added_by        ON drawer TYPE option<string>;
-DEFINE FIELD filed_at        ON drawer TYPE datetime DEFAULT time::now();
+DEFINE FIELD filed_at        ON drawer TYPE datetime VALUE $value OR time::now() DEFAULT time::now();  -- VALUE clause required: DEFAULT alone does not survive UPSERT CONTENT in SurrealDB 3.0.4
 DEFINE FIELD normalize_version ON drawer TYPE int DEFAULT 2;
 DEFINE FIELD entities        ON drawer TYPE option<array<string>>; -- flat names, for cheap filter
 
 -- catch-all for stragglers without a migration per new key
-DEFINE FIELD metadata        ON drawer FLEXIBLE TYPE option<object>;
+DEFINE FIELD metadata        ON drawer TYPE option<object> FLEXIBLE;  -- NOTE: FLEXIBLE goes AFTER TYPE in SurrealDB 3.0.4; `FLEXIBLE TYPE option<object>` is a parse error
 ```
 
 ### `closet`
@@ -65,14 +64,14 @@ Same shape as `drawer` — different table so queries can target one or the othe
 DEFINE TABLE wing SCHEMAFULL;
 DEFINE FIELD name       ON wing TYPE string ASSERT $value != NONE;
 DEFINE FIELD kind       ON wing TYPE string DEFAULT 'unknown';  -- person | project | topic
-DEFINE FIELD created_at ON wing TYPE datetime DEFAULT time::now();
+DEFINE FIELD created_at ON wing TYPE datetime VALUE $value OR time::now() DEFAULT time::now();
 DEFINE INDEX wing_name  ON wing FIELDS name UNIQUE;
 
 DEFINE TABLE room SCHEMAFULL;
 DEFINE FIELD name       ON room TYPE string ASSERT $value != NONE;
 DEFINE FIELD wing       ON room TYPE record<wing>;
 DEFINE FIELD date       ON room TYPE option<string>;            -- ISO day for day-rooms
-DEFINE FIELD created_at ON room TYPE datetime DEFAULT time::now();
+DEFINE FIELD created_at ON room TYPE datetime VALUE $value OR time::now() DEFAULT time::now();
 DEFINE INDEX room_wing_name ON room FIELDS wing, name UNIQUE;
 ```
 
@@ -83,8 +82,8 @@ DEFINE TABLE entity SCHEMAFULL;
 DEFINE FIELD slug       ON entity TYPE string;                  -- lowercased/underscored "max_morgan"
 DEFINE FIELD name       ON entity TYPE string;                  -- display name
 DEFINE FIELD type       ON entity TYPE string DEFAULT 'unknown';
-DEFINE FIELD properties ON entity FLEXIBLE TYPE object DEFAULT {};
-DEFINE FIELD created_at ON entity TYPE datetime DEFAULT time::now();
+DEFINE FIELD properties ON entity TYPE object FLEXIBLE DEFAULT {};  -- FLEXIBLE follows TYPE; reverse order is a parse error in SurrealDB 3.0.4
+DEFINE FIELD created_at ON entity TYPE datetime VALUE $value OR time::now() DEFAULT time::now();
 DEFINE INDEX entity_slug ON entity FIELDS slug UNIQUE;
 ```
 
@@ -93,14 +92,14 @@ DEFINE INDEX entity_slug ON entity FIELDS slug UNIQUE;
 ```surrealql
 DEFINE TABLE triple TYPE RELATION FROM entity TO entity SCHEMAFULL;
 DEFINE FIELD predicate        ON triple TYPE string ASSERT $value != NONE;
-DEFINE FIELD valid_from       ON triple TYPE option<datetime>;
-DEFINE FIELD valid_to         ON triple TYPE option<datetime>;
+DEFINE FIELD valid_from       ON triple TYPE option<string>;   -- ISO date/datetime string (e.g. "2015-04-01"); matches SQLite caller semantics — kg_surreal.py passes plain ISO strings, not Surreal `d'...'` literals
+DEFINE FIELD valid_to         ON triple TYPE option<string>;   -- ditto; keeping as string avoids forcing callers to emit `d'2015-04-01'` datetime literals
 DEFINE FIELD confidence       ON triple TYPE float DEFAULT 1.0;
 DEFINE FIELD source_drawer    ON triple TYPE option<record<drawer>>;  -- replaces source_drawer_id
 DEFINE FIELD source_closet    ON triple TYPE option<record<closet>>;
 DEFINE FIELD source_file      ON triple TYPE option<string>;
 DEFINE FIELD adapter_name     ON triple TYPE option<string>;
-DEFINE FIELD extracted_at     ON triple TYPE datetime DEFAULT time::now();
+DEFINE FIELD extracted_at     ON triple TYPE datetime VALUE $value OR time::now() DEFAULT time::now();
 ```
 
 ### `attribute`
@@ -110,8 +109,8 @@ DEFINE TABLE attribute SCHEMAFULL;
 DEFINE FIELD entity     ON attribute TYPE record<entity>;
 DEFINE FIELD key        ON attribute TYPE string;
 DEFINE FIELD value      ON attribute TYPE option<string>;
-DEFINE FIELD valid_from ON attribute TYPE option<datetime>;
-DEFINE FIELD valid_to   ON attribute TYPE option<datetime>;
+DEFINE FIELD valid_from ON attribute TYPE option<string>;   -- ISO date/datetime string (see `triple.valid_from` note)
+DEFINE FIELD valid_to   ON attribute TYPE option<string>;
 DEFINE INDEX attribute_pk ON attribute FIELDS entity, key, valid_from UNIQUE;
 ```
 
@@ -123,7 +122,7 @@ DEFINE FIELD schema_version  ON palace_meta TYPE int;
 DEFINE FIELD embedder_name   ON palace_meta TYPE string;        -- e.g. "all-MiniLM-L6-v2"
 DEFINE FIELD embedding_dim   ON palace_meta TYPE int;           -- e.g. 384
 DEFINE FIELD hnsw_space      ON palace_meta TYPE string DEFAULT 'cosine';
-DEFINE FIELD created_at      ON palace_meta TYPE datetime DEFAULT time::now();
+DEFINE FIELD created_at      ON palace_meta TYPE datetime VALUE $value OR time::now() DEFAULT time::now();
 ```
 Single canonical row at `palace_meta:main`. Used by the backend to enforce `DimensionMismatchError` / `EmbedderIdentityMismatchError` on write (RFC 001 contract).
 
@@ -134,21 +133,22 @@ Single canonical row at `palace_meta:main`. Used by the backend to enforce `Dime
 KG triples use native SurrealDB edges — replaces the SQLite `(subject, predicate, object)` join pattern:
 
 ```surrealql
--- Write
+-- Write (valid_from/valid_to are strings — plain ISO dates; no `d'...'` literal required)
 RELATE entity:max->triple->entity:alice
   SET predicate  = 'child_of',
-      valid_from = d'2015-04-01T00:00:00Z',
+      valid_from = '2015-04-01',
       confidence = 1.0,
       source_drawer = drawer:⟨drawer_personal_2026-04-23_abc123⟩;
 
 -- Query "everything about Max, outgoing, valid on 2026-01-15"
+-- String comparison works because ISO 8601 date strings sort lexicographically.
 SELECT *, out.name AS object_name
 FROM entity:max->triple
-WHERE (valid_from IS NONE OR valid_from <= d'2026-01-15')
-  AND (valid_to   IS NONE OR valid_to   >= d'2026-01-15');
+WHERE (valid_from IS NONE OR valid_from <= '2026-01-15')
+  AND (valid_to   IS NONE OR valid_to   >= '2026-01-15');
 
 -- Incoming: `<-triple<-entity`. Both directions: union.
--- Invalidate: UPDATE triple WHERE in=... AND predicate=... AND valid_to IS NONE SET valid_to = d'...';
+-- Invalidate: UPDATE triple WHERE in=... AND predicate=... AND valid_to IS NONE SET valid_to = '...';
 ```
 
 Semantic parity with `knowledge_graph.py::query_entity(as_of=, direction=)` is direct. No join table needed; graph traversal is first-class.
@@ -220,3 +220,14 @@ The `surreal.py` backend should idempotently run these on first `get_collection(
 - **HNSW tuning.** `M=16, EFC=150` is a reasonable default for palaces up to ~1M drawers; needs benchmarking on the 135K-drawer fork palace referenced in `chroma.py::quarantine_stale_hnsw`. Open: does SurrealDB HNSW exhibit the same stale-segment class of bug? Needs a soak test before shipping.
 - **BM25 as hybrid primary.** Today `searcher.py` runs BM25 in-process. Moving it into the DB removes a whole module but changes the latency envelope — budget is ≤500ms hooks, ≤100ms startup; bench the BM25+HNSW `OR` path before removing the external BM25.
 - **No Rust-segment crash class.** Chroma's BLOB-seq-id bug and stale-HNSW quarantine (`chroma.py`) go away entirely. Biggest single reliability win of the migration.
+
+---
+
+## 7. Schema doc lessons learned
+
+This schema has been real-world tested: the fixes below landed after implementing the SurrealDB backend (mp-6xi) and the KG port (mp-4yf) against SurrealDB 3.0.4. Future readers can trust the DDL above compiles and round-trips through `UPSERT CONTENT` / `RELATE` without surprises.
+
+- **mp-6zy — FLEXIBLE clause order.** SurrealDB 3.0.4 parses `DEFINE FIELD ... FLEXIBLE TYPE option<object>` as an error. The working form is `TYPE option<object> FLEXIBLE` (FLEXIBLE after the type). Applied to `drawer.metadata` and `entity.properties`.
+- **mp-5js — duplicate `drawer.embedding`.** The original doc defined `drawer.embedding` twice; the second (with the `array::len` ASSERT against `palace_meta:main.embedding_dim`) is the correct one. Duplicate removed.
+- **mp-m1z — `DEFAULT time::now()` does not survive `UPSERT CONTENT`.** The second UPSERT fails with "Expected `datetime` but found `NONE`" because `UPSERT CONTENT` overlays the incoming object and DEFAULT is only evaluated on CREATE. The working pattern is `VALUE $value OR time::now() DEFAULT time::now()` — the `VALUE` clause re-fills on every write. Applied to every `*_at` datetime field (drawer, wing, room, entity, triple, palace_meta).
+- **mp-7wg — `valid_from` / `valid_to` retyped to `option<string>`.** Callers (the KG port in `kg_surreal.py`, matching the existing SQLite semantics of `knowledge_graph.py`) pass plain ISO date strings like `"2015-04-01"`, not Surreal `d'...'` datetime literals. Typing as `datetime` forced every call site to emit the `d'...'` prefix and made SCHEMALESS the only escape hatch. Typing as `option<string>` keeps SCHEMAFULL and matches caller reality; ISO 8601 strings sort lexicographically so the temporal validity range query still works as-is.
