@@ -276,6 +276,7 @@ def cmd_migrate_to_surreal(args):
             dry_run=args.dry_run,
             batch_size=args.batch_size,
             allow_merge=getattr(args, "allow_merge", False),
+            sqlite_direct=getattr(args, "sqlite_direct", False),
         )
     except FileNotFoundError as e:
         print(f"\n  {e}", file=sys.stderr)
@@ -941,6 +942,17 @@ def main():
         "--dry-run",
         action="store_true",
         help="Count what would be migrated without writing anything",
+    )
+    p_migrate_surreal.add_argument(
+        "--sqlite-direct",
+        action="store_true",
+        help=(
+            "Bypass chromadb.PersistentClient and read drawers + metadata "
+            "straight from chroma.sqlite3. Use when the palace's HNSW .bin "
+            "files are too large or corrupt for Chroma to open (it segfaults "
+            "on load). Embeddings are regenerated on the Surreal side via "
+            "auto-embedding on upsert."
+        ),
     )
     p_migrate_surreal.add_argument(
         "--batch-size",

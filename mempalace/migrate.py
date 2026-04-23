@@ -319,6 +319,101 @@ def _open_chroma_readonly(palace_path: str):
     return ChromaBackend()
 
 
+def _iter_chroma_sqlite_batches(palace_path: str, collection_name: str, batch_size: int):
+    """Yield drawer batches by reading chroma.sqlite3 directly.
+
+    Fallback for palaces whose HNSW .bin files are too large or corrupted
+    for ``chromadb.PersistentClient`` to open without segfaulting —
+    ``count()`` and ``get()`` both load the full index. Documents live in
+    ``embedding_fulltext_search_content``, metadata in ``embedding_metadata``;
+    joining on the integer ``id`` reconstructs the drawer shape the
+    Chroma-native iterator produces, minus the vectors (which live in the
+    unreadable ``.bin`` files). The Surreal upsert path auto-embeds from
+    the document text when ``embeddings=None`` so recall parity holds.
+    """
+    import sqlite3
+
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"chroma.sqlite3 not found at {db_path}")
+
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM collections WHERE name = ?", (collection_name,))
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(f"collection {collection_name!r} not found in {db_path}")
+        coll_id = row[0]
+        cur.execute("SELECT id FROM segments WHERE collection = ?", (coll_id,))
+        seg_ids = [r[0] for r in cur.fetchall()]
+        if not seg_ids:
+            return
+        placeholders = ",".join("?" * len(seg_ids))
+        # Pull drawer ids in stable order. ``embeddings.id`` is the int FK
+        # that joins to documents (``embedding_fulltext_search_content.id``)
+        # and metadata (``embedding_metadata.id``).
+        cur.execute(
+            f"SELECT id, embedding_id FROM embeddings WHERE segment_id IN ({placeholders}) ORDER BY id",
+            seg_ids,
+        )
+        all_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    batch: list[tuple[int, str]] = []
+    for row in all_rows:
+        batch.append(row)
+        if len(batch) >= batch_size:
+            yield _materialize_sqlite_batch(db_path, batch)
+            batch = []
+    if batch:
+        yield _materialize_sqlite_batch(db_path, batch)
+
+
+def _materialize_sqlite_batch(db_path: str, rows: list[tuple[int, str]]):
+    """Resolve a batch of (int_id, embedding_id) into (ids, docs, metas, None)."""
+    import sqlite3
+
+    int_ids = [r[0] for r in rows]
+    ext_ids = [r[1] for r in rows]
+    placeholders = ",".join("?" * len(int_ids))
+
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT id, c0 FROM embedding_fulltext_search_content WHERE id IN ({placeholders})",
+            int_ids,
+        )
+        docs_by_id = {iid: (doc or "") for iid, doc in cur.fetchall()}
+        cur.execute(
+            f"SELECT id, key, string_value, int_value, float_value, bool_value "
+            f"FROM embedding_metadata WHERE id IN ({placeholders})",
+            int_ids,
+        )
+        meta_by_id: dict[int, dict] = {iid: {} for iid in int_ids}
+        for iid, key, sv, iv, fv, bv in cur.fetchall():
+            if key == "chroma:document":
+                continue  # Chroma's internal shadow — not user metadata.
+            if sv is not None:
+                meta_by_id[iid][key] = sv
+            elif iv is not None:
+                meta_by_id[iid][key] = iv
+            elif fv is not None:
+                meta_by_id[iid][key] = fv
+            elif bv is not None:
+                meta_by_id[iid][key] = bool(bv)
+    finally:
+        conn.close()
+
+    docs = [docs_by_id.get(i, "") for i in int_ids]
+    metas = [meta_by_id.get(i, {}) for i in int_ids]
+    return ext_ids, docs, metas, None  # embeddings=None → Surreal auto-embeds
+
+
 def _iter_chroma_batches(col, batch_size: int):
     """Yield batches of ``(ids, documents, metadatas, embeddings)`` from a
     Chroma collection using offset-paginated ``get(...)`` calls.
@@ -562,6 +657,68 @@ def _resolve_surreal_connection(
     }
 
 
+class _SqliteDirectSource:
+    """Sentinel handed to :func:`_migrate_one_collection` when ``sqlite_direct``
+    is active. Looks enough like a Chroma collection for the migrate loop to
+    dispatch, but reads documents + metadata straight from ``chroma.sqlite3``.
+    """
+
+    def __init__(self, palace_path: str, collection_name: str, count: int):
+        self.palace_path = palace_path
+        self.collection_name = collection_name
+        self._count = count
+
+    def count(self) -> int:
+        return self._count
+
+
+def _open_source_collections_sqlite(
+    source_palace: str, progress: bool
+) -> tuple[dict[str, object], dict[str, int]]:
+    """Build source collection handles by reading chroma.sqlite3 directly.
+
+    Used when the palace's HNSW .bin files are too large / corrupt for
+    ``chromadb.PersistentClient`` to open. Counts come from a SQL
+    ``COUNT(*)`` on ``embeddings`` rows filtered to the collection's
+    segments — no HNSW load.
+    """
+    import sqlite3
+
+    db_path = os.path.join(source_palace, "chroma.sqlite3")
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"chroma.sqlite3 not found at {db_path}")
+
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    source_counts: dict[str, int] = {}
+    source_collections: dict[str, object] = {}
+    try:
+        for src_name, _dst_table in _COLLECTION_MAP:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM collections WHERE name = ?", (src_name,))
+            row = cur.fetchone()
+            if not row:
+                continue
+            coll_id = row[0]
+            cur.execute("SELECT id FROM segments WHERE collection = ?", (coll_id,))
+            seg_ids = [r[0] for r in cur.fetchall()]
+            if not seg_ids:
+                continue
+            placeholders = ",".join("?" * len(seg_ids))
+            cur.execute(
+                f"SELECT COUNT(*) FROM embeddings WHERE segment_id IN ({placeholders})",
+                seg_ids,
+            )
+            cnt = cur.fetchone()[0]
+            source_collections[src_name] = _SqliteDirectSource(source_palace, src_name, cnt)
+            source_counts[src_name] = cnt
+            if progress:
+                print(f"  {src_name}: {cnt} drawers in source (sqlite-direct)")
+    finally:
+        conn.close()
+    return source_collections, source_counts
+
+
 def _open_source_collections(
     chroma_backend,
     source_palace: str,
@@ -620,10 +777,16 @@ def _migrate_one_collection(
     col_migrated = 0
     errors: list[str] = []
     last_batch_ids: list[str] = []
+    # Select iterator based on source type: _SqliteDirectSource bypasses
+    # chromadb entirely and reads from chroma.sqlite3 via raw SQL.
+    if isinstance(src_col, _SqliteDirectSource):
+        batch_iter = _iter_chroma_sqlite_batches(
+            src_col.palace_path, src_col.collection_name, batch_size
+        )
+    else:
+        batch_iter = _iter_chroma_batches(src_col, batch_size)
     try:
-        for batch_ids, batch_docs, batch_metas, batch_embeds in _iter_chroma_batches(
-            src_col, batch_size
-        ):
+        for batch_ids, batch_docs, batch_metas, batch_embeds in batch_iter:
             last_batch_ids = batch_ids
             norm_metas = [_normalize_metadata_for_surreal(m) for m in batch_metas]
             # Upsert is the idempotency guarantee: running this whole
@@ -649,11 +812,21 @@ def _migrate_one_collection(
             print(f"\n  ERROR: {msg}")
         raise
 
-    ok, verify_errors = _verify_migration(src_col, dst_col, label=src_name)
-    errors.extend(verify_errors)
-    if not ok and progress:
-        for err in verify_errors[:5]:
-            print(f"  VERIFY FAIL: {err}")
+    if isinstance(src_col, _SqliteDirectSource):
+        # No in-process verify — chromadb.PersistentClient.get() is exactly
+        # what sqlite_direct exists to avoid. Use ``mempalace verify-migration``
+        # (mp-dju) for a dedicated post-migration audit when needed.
+        ok = col_migrated == src_count
+        if not ok:
+            errors.append(
+                f"{src_name}: migrated {col_migrated} but source count was {src_count}"
+            )
+    else:
+        ok, verify_errors = _verify_migration(src_col, dst_col, label=src_name)
+        errors.extend(verify_errors)
+        if not ok and progress:
+            for err in verify_errors[:5]:
+                print(f"  VERIFY FAIL: {err}")
     return col_migrated, ok, errors
 
 
@@ -669,6 +842,7 @@ def migrate_to_surreal(
     surreal_pass: Optional[str] = None,
     progress: bool = True,
     allow_merge: bool = False,
+    sqlite_direct: bool = False,
 ) -> dict:
     """Migrate drawers + embeddings from a Chroma palace into SurrealDB (mp-ciw).
 
@@ -722,10 +896,22 @@ def migrate_to_surreal(
         if dry_run:
             print("  Mode:          DRY RUN (no writes)")
 
-    chroma_backend = _open_chroma_readonly(source_palace)
-    source_collections, source_counts = _open_source_collections(
-        chroma_backend, source_palace, progress
-    )
+    if sqlite_direct:
+        # Bypass ChromaDB entirely — read documents + metadata from
+        # chroma.sqlite3 via raw SQL. Needed when the palace's HNSW .bin
+        # files are too large / corrupt for chromadb.PersistentClient to
+        # load (it segfaults on open). Embeddings are NOT read from disk;
+        # the Surreal auto-embed path regenerates them on upsert. Counts
+        # come from the SQL COUNT on the segments-joined embeddings rows.
+        chroma_backend = None
+        source_collections, source_counts = _open_source_collections_sqlite(
+            source_palace, progress
+        )
+    else:
+        chroma_backend = _open_chroma_readonly(source_palace)
+        source_collections, source_counts = _open_source_collections(
+            chroma_backend, source_palace, progress
+        )
 
     total_source = sum(source_counts.values())
     if progress:
