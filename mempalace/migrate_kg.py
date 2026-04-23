@@ -42,7 +42,12 @@ Design rules (from the task brief)
   endpoints defensively anyway. This keeps behaviour correct even if the
   SQLite ``entities`` table is missing a row its own triples reference.
 * **Verification.** After migration we sample 10 random triples from
-  SQLite and confirm they exist in Surreal with matching core fields.
+  SQLite and confirm they exist in Surreal with every provenance field
+  matching (predicate, valid_from, valid_to, confidence, source_closet,
+  source_file, source_drawer_id, adapter_name). We also sample 10
+  entities and confirm ``type`` and ``properties`` round-trip intact.
+  Only ``extracted_at`` and generated record ids are excluded — both
+  cross format boundaries (see ``_verify_triple_in_surreal``).
 """
 
 from __future__ import annotations
@@ -56,6 +61,11 @@ from .kg_surreal import KnowledgeGraphSurreal
 
 
 DEFAULT_BATCH_SIZE = 500
+# Surreal write batch — how many triples we group into one multi-statement
+# RELATE round-trip (mp-ayu). 100 keeps the outgoing WebSocket frame well
+# under typical limits while collapsing the per-triple RTT that dominated
+# 10k+-triple migrations. Override per-run via the CLI ``--kg-batch-size``.
+DEFAULT_KG_BATCH_SIZE = 100
 
 
 # ── Source reader ──────────────────────────────────────────────────────
@@ -157,6 +167,16 @@ class MigrationResult:
     verification_sampled: int
     verification_ok: int
     verification_failures: list[dict[str, Any]]
+    entity_verification_sampled: int = 0
+    entity_verification_ok: int = 0
+    entity_verification_failures: list[dict[str, Any]] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        # Dataclass can't default a mutable ``list`` via ``= []`` — use
+        # ``None`` sentinel and fix up here. Keeps the dataclass body
+        # simple without a ``field(default_factory=list)`` import.
+        if self.entity_verification_failures is None:
+            self.entity_verification_failures = []
 
     @property
     def ok(self) -> bool:
@@ -164,6 +184,7 @@ class MigrationResult:
             self.entities_written == self.entities_source
             and self.triples_written == self.triples_source
             and self.verification_ok == self.verification_sampled
+            and self.entity_verification_ok == self.entity_verification_sampled
         )
 
 
@@ -177,6 +198,7 @@ def migrate_kg_to_surreal(
     namespace: str = "mempalace",
     database: str = "kg",
     batch_size: int = DEFAULT_BATCH_SIZE,
+    kg_batch_size: int = DEFAULT_KG_BATCH_SIZE,
     verify_sample_size: int = 10,
     rng: Optional[random.Random] = None,
     progress: bool = True,
@@ -194,9 +216,16 @@ def migrate_kg_to_surreal(
         and close it before returning. Tests pass a live instance so the
         fixture can tear the DB down cleanly.
     batch_size:
-        Progress-print granularity. Does not affect Surreal write
-        batching — ``add_triple`` is one network round-trip per triple
-        regardless, matching the SQLite KG's per-triple commit model.
+        Progress-print granularity. Independent of ``kg_batch_size``:
+        entity rows still print one line per ``batch_size`` upserts,
+        and triple progress prints one line per Surreal write batch.
+    kg_batch_size:
+        How many triples to bundle into a single
+        :meth:`KnowledgeGraphSurreal.add_triples_batch` call — that is
+        the on-the-wire batch size (mp-ayu). 100 is the default and
+        keeps round-trips in the sub-millisecond-per-triple range even
+        at 10k+ triples. Raise it for faster bulk loads if the Surreal
+        frame size holds; lower it to cap memory on very wide triples.
     verify_sample_size:
         How many random triples to re-read from Surreal post-migration
         and check against SQLite. ``0`` disables verification.
@@ -255,26 +284,57 @@ def migrate_kg_to_surreal(
                     print(f"  entities: {i}/{entities_total}")
 
             # ── Triples ────────────────────────────────────────────────
+            # mp-ayu: batch N triples per Surreal round-trip.
+            # ``add_triples_batch`` collapses entity ensure + dedup check
+            # + N RELATEs into 3 queries total (vs the old 3N+). Progress
+            # prints per batch, not per triple, so the output stays sane
+            # at 10k+ scale.
             triples_written = 0
-            for i, tri in enumerate(_iter_triples(conn), start=1):
-                surreal.add_triple(
-                    tri["subject_name"],
-                    tri["predicate"],
-                    tri["object_name"],
-                    valid_from=tri["valid_from"],
-                    valid_to=tri["valid_to"],
-                    confidence=tri["confidence"],
-                    source_closet=tri["source_closet"],
-                    source_file=tri["source_file"],
-                    source_drawer_id=tri["source_drawer_id"],
-                    adapter_name=tri["adapter_name"],
-                    extracted_at=_normalize_extracted_at(tri["extracted_at"]),
+            batch: list[dict[str, Any]] = []
+
+            def _flush() -> None:
+                nonlocal triples_written
+                if not batch:
+                    return
+                surreal.add_triples_batch(batch)
+                triples_written += len(batch)
+                if progress:
+                    print(f"  triples:  {triples_written}/{triples_total}")
+                batch.clear()
+
+            for tri in _iter_triples(conn):
+                batch.append(
+                    {
+                        "subject": tri["subject_name"],
+                        "predicate": tri["predicate"],
+                        "obj": tri["object_name"],
+                        "valid_from": tri["valid_from"],
+                        "valid_to": tri["valid_to"],
+                        "confidence": tri["confidence"],
+                        "source_closet": tri["source_closet"],
+                        "source_file": tri["source_file"],
+                        "source_drawer_id": tri["source_drawer_id"],
+                        "adapter_name": tri["adapter_name"],
+                        "extracted_at": _normalize_extracted_at(tri["extracted_at"]),
+                    }
                 )
-                triples_written += 1
-                if progress and (i % batch_size == 0 or i == triples_total):
-                    print(f"  triples:  {i}/{triples_total}")
+                if len(batch) >= kg_batch_size:
+                    _flush()
+            _flush()
 
             # ── Verification ───────────────────────────────────────────
+            # Every SQLite column that exists on the source must be
+            # checked on the target — otherwise the spot check is a
+            # rubber stamp. We audit:
+            #   triples: predicate, valid_from, valid_to, confidence,
+            #            source_closet, source_file, source_drawer_id,
+            #            adapter_name. (extracted_at + id are excluded
+            #            by design; see ``_verify_triple_in_surreal``.)
+            #   entities: type, properties (the only non-provenance,
+            #             non-trivial columns on the entities table —
+            #             created_at is SQLite-generated, id is the
+            #             slug, name is already checked by the triple
+            #             endpoint match.)
             sample_size = min(verify_sample_size, triples_total)
             failures: list[dict[str, Any]] = []
             ok = 0
@@ -283,7 +343,8 @@ def migrate_kg_to_surreal(
                 all_triples = list(_iter_triples(conn))
                 sample = rng.sample(all_triples, sample_size)
                 for tri in sample:
-                    if _verify_triple_in_surreal(surreal, tri):
+                    mismatch = _verify_triple_in_surreal(surreal, tri)
+                    if mismatch is None:
                         ok += 1
                     else:
                         failures.append(
@@ -293,12 +354,41 @@ def migrate_kg_to_surreal(
                                 "object": tri["object_name"],
                                 "valid_from": tri["valid_from"],
                                 "valid_to": tri["valid_to"],
+                                "reason": mismatch,
                             }
                         )
 
                 if progress:
                     print(f"  verification: {ok}/{sample_size} triples round-tripped")
                     for f in failures:
+                        print(f"    MISS: {f}")
+
+            # Entity verification — sample the same number of entities
+            # (capped by source count) and confirm type + properties
+            # round-trip. Without this step a migration that silently
+            # dropped every entity's ``type``/``properties`` would still
+            # pass the old spot check.
+            ent_sample_size = min(verify_sample_size, entities_total)
+            ent_failures: list[dict[str, Any]] = []
+            ent_ok = 0
+            if ent_sample_size > 0:
+                all_entities = list(_iter_entities(conn))
+                ent_sample = rng.sample(all_entities, ent_sample_size)
+                for ent in ent_sample:
+                    mismatch = _verify_entity_in_surreal(surreal, ent)
+                    if mismatch is None:
+                        ent_ok += 1
+                    else:
+                        ent_failures.append(
+                            {
+                                "name": ent["name"],
+                                "reason": mismatch,
+                            }
+                        )
+
+                if progress:
+                    print(f"  verification: {ent_ok}/{ent_sample_size} entities round-tripped")
+                    for f in ent_failures:
                         print(f"    MISS: {f}")
 
             return MigrationResult(
@@ -309,6 +399,9 @@ def migrate_kg_to_surreal(
                 verification_sampled=sample_size,
                 verification_ok=ok,
                 verification_failures=failures,
+                entity_verification_sampled=ent_sample_size,
+                entity_verification_ok=ent_ok,
+                entity_verification_failures=ent_failures,
             )
         finally:
             conn.close()
@@ -339,38 +432,151 @@ def _normalize_extracted_at(raw: Optional[str]) -> Optional[str]:
     return value + "Z"
 
 
-def _verify_triple_in_surreal(surreal: KnowledgeGraphSurreal, source: dict[str, Any]) -> bool:
+def _verify_triple_in_surreal(
+    surreal: KnowledgeGraphSurreal, source: dict[str, Any]
+) -> Optional[str]:
     """Confirm ``source`` exists in Surreal with matching core fields.
 
-    Checks predicate, valid_from/to, confidence, source_drawer_id. We
-    deliberately do *not* check ``extracted_at`` or triple ``id`` because
-    both are naturally regenerated by the Surreal side and the task
-    brief explicitly accepts new triple IDs.
+    Returns
+    -------
+    ``None`` when every checked field matches; otherwise a short string
+    describing the first mismatch (for failure reporting).
+
+    Checks EVERY SQLite triple column that the migration passes through:
+    ``predicate``, ``valid_from``, ``valid_to``, ``confidence``,
+    ``source_closet``, ``source_file``, ``source_drawer_id``,
+    ``adapter_name``.
+
+    ``extracted_at`` and triple ``id`` are intentionally excluded:
+
+    * ``id`` is regenerated by the Surreal RELATE — the migration brief
+      accepts a fresh id.
+    * ``extracted_at`` crosses a format boundary (SQLite
+      ``"YYYY-MM-DD HH:MM:SS"`` -> Surreal ``datetime``). Bit-exact
+      equality is impossible; the dedicated audit
+      (``verify_migration.py``) handles it with a date-prefix rule.
+
+    Any other SQLite column must be checked here — otherwise a silently
+    dropped field would round-trip as "OK" and the spot check becomes a
+    rubber stamp.
     """
-    pred = source["predicate"]
+    pred_norm = surreal._normalize_predicate(source["predicate"])
     sub_rec = surreal._entity_record(source["subject_name"])
     obj_rec = surreal._entity_record(source["object_name"])
 
     rows = surreal._db.query(
         (
             "SELECT predicate, valid_from, valid_to, confidence, "
-            "source_drawer_id "
+            "source_closet, source_file, source_drawer_id, adapter_name "
             "FROM triple WHERE in = $sub AND out = $obj "
             "AND predicate = $pred"
         ),
-        {"sub": sub_rec, "obj": obj_rec, "pred": pred},
+        {"sub": sub_rec, "obj": obj_rec, "pred": pred_norm},
     )
     if not rows:
-        return False
+        return "missing: no triple with matching (subject, predicate, object)"
+
+    # Candidates for this (sub, pred, obj) — the right one matches
+    # valid_from + valid_to first, then every provenance field.
+    last_reason = "no candidate matched valid_from/valid_to"
     for row in rows:
-        if (
-            row.get("valid_from") == source["valid_from"]
-            and row.get("valid_to") == source["valid_to"]
-            and _approx_eq(row.get("confidence"), source["confidence"])
-            and row.get("source_drawer_id") == source["source_drawer_id"]
-        ):
-            return True
-    return False
+        if row.get("valid_from") != source["valid_from"]:
+            last_reason = f"valid_from: src={source['valid_from']!r} dst={row.get('valid_from')!r}"
+            continue
+        if row.get("valid_to") != source["valid_to"]:
+            last_reason = f"valid_to: src={source['valid_to']!r} dst={row.get('valid_to')!r}"
+            continue
+        # Provenance must match field-for-field on the located row.
+        mismatch = _check_triple_provenance(row, source)
+        if mismatch is None:
+            return None
+        last_reason = mismatch
+    return last_reason
+
+
+def _check_triple_provenance(row: dict[str, Any], source: dict[str, Any]) -> Optional[str]:
+    """Compare every provenance field between a Surreal row and SQLite source.
+
+    Returns the first mismatch as a short string, or ``None`` on full
+    equality. ``confidence`` is compared with a float tolerance; all
+    other fields are compared with ``==`` after treating ``""``/``None``
+    as equivalent (SurrealDB returns ``None`` for unset optional fields
+    and SQLite may store ``NULL`` or empty string depending on the
+    write path).
+    """
+    if not _approx_eq(row.get("confidence"), source["confidence"]):
+        return f"confidence: src={source['confidence']!r} dst={row.get('confidence')!r}"
+    for field_name in (
+        "source_closet",
+        "source_file",
+        "source_drawer_id",
+        "adapter_name",
+    ):
+        src_val = source.get(field_name)
+        dst_val = row.get(field_name)
+        # Treat ``None`` and empty string as equivalent — Surreal drops
+        # NULL-valued optional fields from query results, and SQLite can
+        # legitimately store either. No other falsy coercion: ``0`` and
+        # ``False`` are never valid values for these string columns.
+        if (src_val or None) != (dst_val or None):
+            return f"{field_name}: src={src_val!r} dst={dst_val!r}"
+    return None
+
+
+def _verify_entity_in_surreal(
+    surreal: KnowledgeGraphSurreal, source: dict[str, Any]
+) -> Optional[str]:
+    """Confirm an entity row round-tripped with type + properties intact.
+
+    SQLite's ``entities`` table has these columns:
+
+    * ``id``         — slug; derived from ``name`` the same way on both
+                       sides. Checked implicitly by looking up the
+                       Surreal record by slug.
+    * ``name``       — already verified whenever a triple's endpoint
+                       matches on either side; also checked here on the
+                       Surreal record itself for defence in depth.
+    * ``type``       — must round-trip. Default ``"unknown"`` is still a
+                       value and must land on the target.
+    * ``properties`` — JSON blob; parsed here and compared structurally.
+    * ``created_at`` — SQLite-generated timestamp. Intentionally
+                       excluded (same reason as triples' ``extracted_at``
+                       — format boundary, and the migration brief does
+                       not require it preserved).
+
+    Returns ``None`` on full match, otherwise a short mismatch string.
+    """
+    import json
+
+    rows = surreal._db.query(
+        "SELECT name, type, properties FROM entity WHERE id = $rec",
+        {"rec": surreal._entity_record(source["name"])},
+    )
+    if not rows:
+        return f"missing: no entity for name {source['name']!r}"
+    row = rows[0]
+
+    if row.get("name") != source["name"]:
+        return f"name: src={source['name']!r} dst={row.get('name')!r}"
+
+    # ``type`` default is "unknown" on the SQLite side. Surreal receives
+    # that value verbatim through ``add_entity`` — must round-trip.
+    src_type = source.get("type") or "unknown"
+    dst_type = row.get("type")
+    if dst_type != src_type:
+        return f"type: src={src_type!r} dst={dst_type!r}"
+
+    # Properties: SQLite stores JSON text; Surreal stores a native
+    # object. Normalise both to a dict and compare structurally.
+    src_props_raw = source.get("properties") or "{}"
+    try:
+        src_props = json.loads(src_props_raw) if isinstance(src_props_raw, str) else src_props_raw
+    except (ValueError, TypeError):
+        src_props = {}
+    dst_props = row.get("properties") or {}
+    if src_props != dst_props:
+        return f"properties: src={src_props!r} dst={dst_props!r}"
+    return None
 
 
 def _approx_eq(a: Any, b: Any, tol: float = 1e-6) -> bool:

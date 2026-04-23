@@ -352,6 +352,116 @@ class TestIdempotency:
         assert stats_after_first["current_facts"] == stats_after_second["current_facts"]
 
 
+class TestLargeBatchedMigration:
+    """mp-ayu: batching must scale to many triples without corrupting
+    dedup, ordering, or idempotency.
+
+    We seed 500 triples (well above the default batch size of 100 so at
+    least 5 wire batches flow) and confirm:
+
+    - exactly 500 rows land (no phantoms, no losses);
+    - a *second* run with the same source is a no-op (the dedup
+      pre-check must cross batch boundaries);
+    - provenance (confidence, valid_from, source_drawer_id) round-trips
+      on a deep-read sample.
+    """
+
+    @pytest.fixture
+    def large_sqlite_kg(self, tmp_path):
+        from mempalace.knowledge_graph import KnowledgeGraph
+
+        db_path = tmp_path / "large_kg.sqlite3"
+        kg = KnowledgeGraph(str(db_path))
+
+        # 500 triples with distinct SPOs — the SQLite KG dedupes on
+        # ``(subject, predicate, object)`` regardless of span, so reusing
+        # SPOs would silently collapse rows at the source. We mix 450
+        # open rows (``obj_i``) with 50 closed historical rows
+        # (``hist_i``, same subjects, distinct objects) so the migration
+        # exercises both dedup arms of ``add_triples_batch`` under load.
+        preds = ["knows", "works_at", "lives_in", "likes", "met"]
+        for i in range(450):
+            kg.add_triple(
+                f"subj_{i}",
+                preds[i % len(preds)],
+                f"obj_{i}",
+                valid_from=f"2024-01-{(i % 28) + 1:02d}",
+                confidence=0.5 + (i % 10) / 20.0,
+                source_drawer_id=f"drawer_{i:04d}",
+            )
+        for i in range(50):
+            kg.add_triple(
+                f"subj_{i}",
+                preds[i % len(preds)],
+                f"hist_{i}",
+                valid_from="2010-01-01",
+                valid_to="2015-01-01",
+                confidence=0.7,
+                source_drawer_id=f"drawer_hist_{i:04d}",
+            )
+        kg.close()
+        return str(db_path)
+
+    def test_500_triples_migrate_cleanly(self, large_sqlite_kg, surreal_kg):
+        from mempalace.migrate_kg import migrate_kg_to_surreal
+
+        result = migrate_kg_to_surreal(
+            large_sqlite_kg,
+            surreal=surreal_kg,
+            verify_sample_size=25,
+            rng=random.Random(7),
+            progress=False,
+        )
+        assert result.triples_source == 500
+        assert result.triples_written == 500
+        assert result.verification_ok == result.verification_sampled
+        assert result.ok
+
+        stats = surreal_kg.stats()
+        assert stats["triples"] == 500, f"expected 500 triples on Surreal, got {stats['triples']}"
+
+    def test_500_triple_batch_is_idempotent(self, large_sqlite_kg, surreal_kg):
+        """Batched re-run of a fully-completed migration must be a
+        no-op across batch boundaries."""
+        from mempalace.migrate_kg import migrate_kg_to_surreal
+
+        migrate_kg_to_surreal(
+            large_sqlite_kg,
+            surreal=surreal_kg,
+            verify_sample_size=0,
+            progress=False,
+        )
+        stats_first = surreal_kg.stats()
+
+        migrate_kg_to_surreal(
+            large_sqlite_kg,
+            surreal=surreal_kg,
+            verify_sample_size=0,
+            progress=False,
+        )
+        stats_second = surreal_kg.stats()
+
+        assert stats_first == stats_second, (
+            f"batched re-run changed state: {stats_first} -> {stats_second}"
+        )
+
+    def test_500_triple_batch_size_override(self, large_sqlite_kg, surreal_kg):
+        """Honours ``--kg-batch-size`` — the same load arrives with
+        a smaller batch size and still lands exactly 500 rows."""
+        from mempalace.migrate_kg import migrate_kg_to_surreal
+
+        result = migrate_kg_to_surreal(
+            large_sqlite_kg,
+            surreal=surreal_kg,
+            kg_batch_size=37,  # coprime with 500 so the last batch is partial
+            verify_sample_size=10,
+            rng=random.Random(11),
+            progress=False,
+        )
+        assert result.triples_written == 500
+        assert surreal_kg.stats()["triples"] == 500
+
+
 class TestEmptySource:
     """Migrating an empty KG is not an error."""
 
@@ -372,3 +482,186 @@ class TestEmptySource:
         assert result.triples_written == 0
         assert result.verification_sampled == 0
         assert result.ok
+
+
+# ── mp-ui1: full-provenance verification tests ──────────────────────────
+
+
+@pytest.fixture
+def all_fields_kg(tmp_path):
+    """A tiny KG where one triple has EVERY provenance field populated.
+
+    The ``_verify_triple_in_surreal`` pre-mp-ui1 only checked five
+    fields. This fixture lands ``adapter_name``, ``source_closet``,
+    and ``source_file`` with distinct, non-empty values so a regression
+    that drops any one of them would be caught by the verification.
+    """
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    db_path = tmp_path / "all_fields.sqlite3"
+    kg = KnowledgeGraph(str(db_path))
+    kg.add_entity("Alice", entity_type="person", properties={"city": "NYC"})
+    kg.add_entity("Max", entity_type="person", properties={"dob": "2015-04-01"})
+    # Two triples so the verifier has something to pick randomly from.
+    kg.add_triple(
+        "Alice",
+        "parent_of",
+        "Max",
+        valid_from="2015-04-01",
+        confidence=0.87,
+        source_closet="personal/2025-10",
+        source_file="/convos/2025/family.md",
+        source_drawer_id="drawer_alice_parent_max_xyz",
+        adapter_name="general",
+    )
+    kg.add_triple(
+        "Alice",
+        "friend_of",
+        "Max",
+        valid_from="2020-01-01",
+        valid_to="2024-06-01",
+        confidence=0.5,
+        source_closet="work",
+        source_file="/convos/2020/note.md",
+        source_drawer_id="drawer_alice_friend_max",
+        adapter_name="exchange",
+    )
+    kg.close()
+    return str(db_path)
+
+
+class TestAllProvenanceFieldsVerified:
+    """mp-ui1: every SQLite column must be covered by the spot check."""
+
+    def test_clean_migration_passes_full_field_verify(self, all_fields_kg, surreal_kg):
+        """A faithful migration must verify clean on every provenance field."""
+        from mempalace.migrate_kg import migrate_kg_to_surreal
+
+        result = migrate_kg_to_surreal(
+            all_fields_kg,
+            surreal=surreal_kg,
+            verify_sample_size=5,  # covers both triples + both entities
+            rng=random.Random(0),
+            progress=False,
+        )
+
+        assert result.triples_source == 2
+        assert result.entities_source == 2
+        assert result.verification_ok == result.verification_sampled
+        assert result.entity_verification_ok == result.entity_verification_sampled
+        assert result.entity_verification_sampled == 2
+        assert result.ok, f"verification failures: {result.verification_failures}"
+
+    @pytest.mark.parametrize(
+        "field, mutated",
+        [
+            ("adapter_name", "DIFFERENT_ADAPTER"),
+            ("source_closet", "DIFFERENT_CLOSET/2030-99"),
+            ("source_file", "/tmp/DIFFERENT_FILE.md"),
+            ("source_drawer_id", "drawer_DIFFERENT_ghost"),
+        ],
+    )
+    def test_mutated_target_provenance_flagged(self, all_fields_kg, surreal_kg, field, mutated):
+        """Divergence in any provenance field must be reported as a failure.
+
+        Post-migration we mutate ONE Surreal triple to differ from its
+        SQLite source on a single provenance field. A second run of the
+        verify logic must flag it — otherwise the spot check is a
+        rubber stamp.
+        """
+        from mempalace.migrate_kg import (
+            _verify_triple_in_surreal,
+            migrate_kg_to_surreal,
+        )
+
+        migrate_kg_to_surreal(
+            all_fields_kg,
+            surreal=surreal_kg,
+            verify_sample_size=0,
+            progress=False,
+        )
+
+        # Mutate the "parent_of" triple's chosen field on the Surreal side.
+        surreal_kg._db.query(
+            f"UPDATE triple SET {field} = $v WHERE predicate = 'parent_of'",
+            {"v": mutated},
+        )
+
+        # Re-read the SQLite row for the 'parent_of' triple and confirm
+        # the verifier now reports a mismatch mentioning the mutated field.
+        conn = sqlite3.connect(all_fields_kg)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT t.*, s.name AS subject_name, o.name AS object_name "
+                "FROM triples t "
+                "JOIN entities s ON t.subject = s.id "
+                "JOIN entities o ON t.object  = o.id "
+                "WHERE t.predicate = 'parent_of'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        source = {
+            "subject_name": row["subject_name"],
+            "object_name": row["object_name"],
+            "predicate": row["predicate"],
+            "valid_from": row["valid_from"],
+            "valid_to": row["valid_to"],
+            "confidence": row["confidence"],
+            "source_closet": row["source_closet"],
+            "source_file": row["source_file"],
+            "source_drawer_id": row["source_drawer_id"],
+            "adapter_name": row["adapter_name"],
+        }
+        reason = _verify_triple_in_surreal(surreal_kg, source)
+        assert reason is not None, f"mutating {field!r} on target must produce a verify failure"
+        assert field in reason, (
+            f"failure reason {reason!r} must mention the mutated field {field!r}"
+        )
+
+    def test_mutated_target_entity_type_flagged(self, all_fields_kg, surreal_kg):
+        """A silently dropped entity ``type`` must be reported as a failure."""
+        from mempalace.migrate_kg import (
+            _verify_entity_in_surreal,
+            migrate_kg_to_surreal,
+        )
+
+        migrate_kg_to_surreal(
+            all_fields_kg,
+            surreal=surreal_kg,
+            verify_sample_size=0,
+            progress=False,
+        )
+
+        # Mutate Alice's type to simulate a migration that dropped the field.
+        surreal_kg._db.query("UPDATE entity SET type = 'unknown' WHERE id = entity:alice")
+        reason = _verify_entity_in_surreal(
+            surreal_kg,
+            {"name": "Alice", "type": "person", "properties": '{"city": "NYC"}'},
+        )
+        assert reason is not None
+        assert "type" in reason
+
+    def test_mutated_target_entity_properties_flagged(self, all_fields_kg, surreal_kg):
+        """A silently dropped entity ``properties`` must be reported as a failure."""
+        from mempalace.migrate_kg import (
+            _verify_entity_in_surreal,
+            migrate_kg_to_surreal,
+        )
+
+        migrate_kg_to_surreal(
+            all_fields_kg,
+            surreal=surreal_kg,
+            verify_sample_size=0,
+            progress=False,
+        )
+
+        # Wipe properties on Max — the verifier must flag the divergence.
+        surreal_kg._db.query("UPDATE entity SET properties = {} WHERE id = entity:max")
+        reason = _verify_entity_in_surreal(
+            surreal_kg,
+            {"name": "Max", "type": "person", "properties": '{"dob": "2015-04-01"}'},
+        )
+        assert reason is not None
+        assert "properties" in reason

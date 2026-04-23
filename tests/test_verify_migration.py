@@ -627,3 +627,175 @@ def test_missing_kg_skips_kg_section(rich_palace, surreal_target, tmp_path):
     assert report.triple_count_target == 0
     # Drawer-side clean — exit_code 0.
     assert report.exit_code == 0
+
+
+# ── mp-ui1: entity + triple full-provenance audit ──────────────────────
+
+
+def test_entity_audit_reports_clean_after_faithful_migration(rich_palace, rich_kg, surreal_target):
+    """Baseline: a clean migration produces zero entity mismatches.
+
+    The rich fixture has 10 entities with ``type`` values ("person",
+    "company", "activity") and two with non-empty ``properties``
+    (Alice -> {"city": "NYC"}, Max -> {"dob": "2015-04-01"}). A faithful
+    migration must round-trip every one of them.
+    """
+    from mempalace.verify_migration import verify_migration
+
+    _run_migration(rich_palace["path"], rich_kg, surreal_target)
+    report = verify_migration(
+        source_palace=rich_palace["path"],
+        source_kg=rich_kg,
+        target_ns=surreal_target,
+        sample_size=50,  # larger than entity count so every one is sampled
+        rng=random.Random(11),
+    )
+    assert report.ok, f"expected clean; mismatches={report.mismatches}"
+    assert report.entity_count_source == 10
+    assert report.entity_count_target == 10
+    assert report.sampled_entities == 10
+    entity_mismatches = [m for m in report.mismatches if m.category == "entity"]
+    assert entity_mismatches == []
+
+
+def test_entity_audit_flags_mutated_type(rich_palace, rich_kg, surreal_target):
+    """Changing one entity's ``type`` must appear as an entity/type mismatch."""
+    from mempalace.backends.surreal import SurrealBackend
+    from mempalace.verify_migration import verify_migration
+
+    _run_migration(rich_palace["path"], rich_kg, surreal_target)
+
+    # Mutate Alice's type to simulate a migration that dropped it.
+    backend = SurrealBackend(namespace=surreal_target)
+    try:
+        from mempalace.migrate import _derive_surreal_db_name
+
+        db_name = _derive_surreal_db_name(rich_palace["path"])
+        conn = backend._connect(db_name)
+        conn.query("UPDATE entity SET type = 'unknown' WHERE id = entity:alice")
+    finally:
+        backend.close()
+
+    report = verify_migration(
+        source_palace=rich_palace["path"],
+        source_kg=rich_kg,
+        target_ns=surreal_target,
+        sample_size=50,
+        rng=random.Random(11),
+    )
+    # Counts still tie so this is a sample-level mismatch (exit 2).
+    assert report.count_mismatch is False
+    assert report.exit_code == 2
+    type_mismatches = [m for m in report.mismatches if m.category == "entity" and m.kind == "type"]
+    assert type_mismatches, f"expected entity/type mismatch for Alice; got {report.mismatches}"
+    assert type_mismatches[0].identifier == "Alice"
+
+
+def test_entity_audit_flags_mutated_properties(rich_palace, rich_kg, surreal_target):
+    """Changing one entity's ``properties`` must appear as an entity/properties mismatch."""
+    from mempalace.backends.surreal import SurrealBackend
+    from mempalace.verify_migration import verify_migration
+
+    _run_migration(rich_palace["path"], rich_kg, surreal_target)
+
+    backend = SurrealBackend(namespace=surreal_target)
+    try:
+        from mempalace.migrate import _derive_surreal_db_name
+
+        db_name = _derive_surreal_db_name(rich_palace["path"])
+        conn = backend._connect(db_name)
+        conn.query("UPDATE entity SET properties = {} WHERE id = entity:max")
+    finally:
+        backend.close()
+
+    report = verify_migration(
+        source_palace=rich_palace["path"],
+        source_kg=rich_kg,
+        target_ns=surreal_target,
+        sample_size=50,
+        rng=random.Random(11),
+    )
+    assert report.exit_code == 2
+    props_mismatches = [
+        m for m in report.mismatches if m.category == "entity" and m.kind == "properties"
+    ]
+    assert props_mismatches, f"expected entity/properties mismatch for Max; got {report.mismatches}"
+    assert props_mismatches[0].identifier == "Max"
+
+
+def test_triple_audit_flags_each_provenance_field(rich_palace, rich_kg, surreal_target):
+    """Divergence on ANY of the four triple provenance fields must be reported.
+
+    mp-ui1: the standalone verify tool already covers
+    ``source_drawer_id`` and ``adapter_name``; ``source_closet`` and
+    ``source_file`` were already in ``_compare_triple`` via the
+    ``for field_ in (...)`` loop. This test pins the contract so a
+    refactor can't silently drop any of them without tripping a red
+    light here.
+    """
+    from mempalace.backends.surreal import SurrealBackend
+    from mempalace.migrate import _derive_surreal_db_name
+    from mempalace.verify_migration import verify_migration
+
+    _run_migration(rich_palace["path"], rich_kg, surreal_target)
+
+    db_name = _derive_surreal_db_name(rich_palace["path"])
+    backend = SurrealBackend(namespace=surreal_target)
+    try:
+        conn = backend._connect(db_name)
+        # Mutate four DIFFERENT triples, each on a different provenance
+        # field, so a single audit run surfaces all four mismatches.
+        conn.query("UPDATE triple SET adapter_name = 'CHANGED' WHERE predicate = 'loves'")
+        conn.query("UPDATE triple SET source_closet = 'CHANGED' WHERE predicate = 'manages'")
+        conn.query(
+            "UPDATE triple SET source_file = '/CHANGED.md' WHERE predicate = 'works_at' AND valid_to IS NOT NONE"
+        )
+        conn.query(
+            "UPDATE triple SET source_drawer_id = 'drawer_CHANGED' WHERE predicate = 'parent_of' AND valid_from = '1985-11-20'"
+        )
+    finally:
+        backend.close()
+
+    report = verify_migration(
+        source_palace=rich_palace["path"],
+        source_kg=rich_kg,
+        target_ns=surreal_target,
+        sample_size=50,  # sample every triple so all four mutations are hit
+        rng=random.Random(11),
+    )
+    assert report.exit_code == 2
+    kinds = {m.kind for m in report.mismatches if m.category == "triple"}
+    for expected in ("adapter_name", "source_closet", "source_file", "source_drawer_id"):
+        assert expected in kinds, (
+            f"expected triple/{expected} mismatch in {kinds}; full mismatches={report.mismatches}"
+        )
+
+
+def test_entity_count_mismatch_trips_count_path(rich_palace, rich_kg, surreal_target):
+    """A target-side entity missing from Surreal must trip exit_code=1."""
+    from mempalace.backends.surreal import SurrealBackend
+    from mempalace.migrate import _derive_surreal_db_name
+    from mempalace.verify_migration import verify_migration
+
+    _run_migration(rich_palace["path"], rich_kg, surreal_target)
+
+    db_name = _derive_surreal_db_name(rich_palace["path"])
+    backend = SurrealBackend(namespace=surreal_target)
+    try:
+        conn = backend._connect(db_name)
+        conn.query("DELETE entity WHERE id = entity:carol")
+    finally:
+        backend.close()
+
+    report = verify_migration(
+        source_palace=rich_palace["path"],
+        source_kg=rich_kg,
+        target_ns=surreal_target,
+        sample_size=50,
+        rng=random.Random(3),
+    )
+    assert report.entity_count_source == 10
+    assert report.entity_count_target == 9
+    assert report.count_delta_entities == -1
+    assert report.count_mismatch is True
+    assert report.exit_code == 1  # count mismatch wins the precedence

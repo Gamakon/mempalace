@@ -44,8 +44,25 @@ appears in target representation" — the same rule the migration's own
 test uses (``test_extracted_at_preserved_not_migration_timestamp``).
 
 All other triple fields (``valid_from``, ``valid_to``, ``confidence``,
-``source_drawer_id``, ``adapter_name``) are required to match exactly
-(floats within ``1e-6``).
+``source_closet``, ``source_file``, ``source_drawer_id``,
+``adapter_name``) are required to match exactly (floats within
+``1e-6``).
+
+Entity fields audited (mp-ui1)
+-------------------------------
+SQLite's ``entities`` table stores ``id``, ``name``, ``type``,
+``properties``, ``created_at``. Every column except ``created_at`` is
+audited here:
+
+* ``id`` — implicit via the slug-based lookup on both sides.
+* ``name`` — compared exactly.
+* ``type`` — required to match exactly (default ``"unknown"`` included).
+* ``properties`` — decoded from JSON text and compared structurally.
+
+``created_at`` is excluded for the same reason as triples'
+``extracted_at`` — it's a SQLite-generated timestamp with no equivalent
+on the Surreal side, and preservation is not part of the migration
+contract.
 """
 
 from __future__ import annotations
@@ -118,8 +135,11 @@ class VerifyReport:
     drawer_count_target: int = 0
     triple_count_source: int = 0
     triple_count_target: int = 0
+    entity_count_source: int = 0
+    entity_count_target: int = 0
     sampled_drawers: int = 0
     sampled_triples: int = 0
+    sampled_entities: int = 0
     mismatches: list[Mismatch] = field(default_factory=list)
     phantom_drawers: list[str] = field(default_factory=list)
     phantom_triples: list[str] = field(default_factory=list)
@@ -134,10 +154,16 @@ class VerifyReport:
         return self.triple_count_target - self.triple_count_source
 
     @property
+    def count_delta_entities(self) -> int:
+        return self.entity_count_target - self.entity_count_source
+
+    @property
     def count_mismatch(self) -> bool:
         if self.count_delta_drawers != 0:
             return True
         if self.kg_checked and self.count_delta_triples != 0:
+            return True
+        if self.kg_checked and self.count_delta_entities != 0:
             return True
         return False
 
@@ -492,6 +518,105 @@ def _count_surreal_triples(surreal) -> int:
     return 0
 
 
+def _iter_sqlite_entities(conn: sqlite3.Connection):
+    """Yield every entity row. ``properties`` stays as JSON text.
+
+    Separate iterator from ``_iter_sqlite_triples`` because entity audit
+    and triple audit have different sampling budgets and endpoint
+    shapes — inlining would muddle both.
+    """
+    cur = conn.execute("SELECT id, name, type, properties FROM entities ORDER BY id")
+    for row in cur:
+        yield {
+            "id": row["id"],
+            "name": row["name"],
+            "type": row["type"] or "unknown",
+            "properties": row["properties"] or "{}",
+        }
+
+
+def _count_surreal_entities(surreal) -> int:
+    """Count ``entity`` rows on the Surreal side."""
+    rows = surreal._db.query("SELECT count() FROM entity GROUP ALL") or []
+    if not rows:
+        return 0
+    row = rows[0] if isinstance(rows, list) else rows
+    if isinstance(row, dict):
+        return int(row.get("count") or 0)
+    return 0
+
+
+def _find_surreal_entity(surreal, ent: dict) -> Optional[dict]:
+    """Return the Surreal row for ``ent`` keyed on the slug.
+
+    Uses the same ``_entity_slug`` function as the KG write paths so a
+    slug-computation bug on one side cannot hide in the audit.
+    """
+    from surrealdb import RecordID
+
+    rec = RecordID("entity", _entity_slug(ent["name"]))
+    rows = surreal._db.query(
+        "SELECT name, type, properties FROM entity WHERE id = $rec",
+        {"rec": rec},
+    )
+    if not rows:
+        return None
+    return rows[0]
+
+
+def _compare_entity(ent: dict, row: dict) -> list[Mismatch]:
+    """Deep-compare a source entity row against its Surreal row.
+
+    Covers ``name``, ``type``, ``properties`` — every SQLite column
+    except the id (implicit in lookup) and ``created_at`` (format
+    boundary, not preserved by design).
+    """
+    import json as _json
+
+    ident = ent["name"]
+    out: list[Mismatch] = []
+    if row.get("name") != ent["name"]:
+        out.append(
+            Mismatch(
+                category="entity",
+                kind="name",
+                identifier=ident,
+                source=ent["name"],
+                target=row.get("name"),
+            )
+        )
+    src_type = ent.get("type") or "unknown"
+    dst_type = row.get("type")
+    if dst_type != src_type:
+        out.append(
+            Mismatch(
+                category="entity",
+                kind="type",
+                identifier=ident,
+                source=src_type,
+                target=dst_type,
+            )
+        )
+    src_props_raw = ent.get("properties") or "{}"
+    try:
+        src_props = _json.loads(src_props_raw) if isinstance(src_props_raw, str) else src_props_raw
+    except (ValueError, TypeError):
+        src_props = {}
+    dst_props = row.get("properties") or {}
+    if src_props != dst_props:
+        out.append(
+            Mismatch(
+                category="entity",
+                kind="properties",
+                identifier=ident,
+                source=src_props,
+                target=dst_props,
+                detail="entity properties differ after JSON decode",
+            )
+        )
+    return out
+
+
 def _iter_sqlite_triples(conn: sqlite3.Connection):
     """Yield every triple row joined with entity display names.
 
@@ -699,12 +824,45 @@ def _audit_kg(
     rng: random.Random,
     report: VerifyReport,
 ) -> None:
-    """Count + sample + phantom-check the KG side of the migration."""
+    """Count + sample + phantom-check the KG side of the migration.
+
+    Audits BOTH sides of the KG:
+
+    * ``triples`` — forward sample (deep field-compare), phantom reverse.
+    * ``entities`` — forward sample on ``type`` + ``properties``. The
+      sampled triples already touch entities as endpoints, but that only
+      verifies the slug mapping. Entity ``type`` + ``properties`` must
+      be separately sampled and compared — otherwise a migration that
+      silently dropped entity metadata would still pass.
+    """
     report.kg_checked = True
     conn = _open_sqlite_readonly(sqlite_path)
     try:
         report.triple_count_source = _count_sqlite(conn, "triples")
         report.triple_count_target = _count_surreal_triples(surreal)
+        report.entity_count_source = _count_sqlite(conn, "entities")
+        report.entity_count_target = _count_surreal_entities(surreal)
+
+        # ── Entity forward sample ────────────────────────────────────
+        all_entities = list(_iter_sqlite_entities(conn))
+        if all_entities and sample_size > 0:
+            ent_sample = rng.sample(all_entities, min(sample_size, len(all_entities)))
+            for ent in ent_sample:
+                report.sampled_entities += 1
+                row = _find_surreal_entity(surreal, ent)
+                if row is None:
+                    report.mismatches.append(
+                        Mismatch(
+                            category="entity",
+                            kind="missing_in_target",
+                            identifier=ent["name"],
+                            source="present in SQLite",
+                            target=None,
+                            detail="no matching entity in Surreal",
+                        )
+                    )
+                    continue
+                report.mismatches.extend(_compare_entity(ent, row))
 
         all_triples = list(_iter_sqlite_triples(conn))
         if all_triples and sample_size > 0:
@@ -951,17 +1109,24 @@ def format_report(report: VerifyReport) -> str:
     )
     if report.kg_checked:
         lines.append(
-            f"    triples: source={report.triple_count_source} "
+            f"    triples:  source={report.triple_count_source} "
             f"target={report.triple_count_target} "
             f"delta={report.count_delta_triples:+d}"
         )
+        lines.append(
+            f"    entities: source={report.entity_count_source} "
+            f"target={report.entity_count_target} "
+            f"delta={report.count_delta_entities:+d}"
+        )
     else:
-        lines.append("    triples: (KG not checked — source KG not provided)")
+        lines.append("    triples:  (KG not checked — source KG not provided)")
+        lines.append("    entities: (KG not checked — source KG not provided)")
     lines.append("")
     lines.append("  Samples deep-compared")
     lines.append("  ---------------------")
-    lines.append(f"    drawers: {report.sampled_drawers}")
-    lines.append(f"    triples: {report.sampled_triples}")
+    lines.append(f"    drawers:  {report.sampled_drawers}")
+    lines.append(f"    triples:  {report.sampled_triples}")
+    lines.append(f"    entities: {report.sampled_entities}")
     lines.append("")
     lines.append(f"  Mismatches found: {len(report.mismatches)}")
     lines.append(
