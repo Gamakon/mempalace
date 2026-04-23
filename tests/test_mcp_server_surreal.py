@@ -305,12 +305,26 @@ class TestSurrealStatusAndCatalog:
     get_taxonomy / get_aaak_spec. Shape-only assertions plus non-error."""
 
     def test_status_empty_palace(self, surreal_mcp):
-        # tool_status on surreal uses create=True unconditionally (mcp_server.py:399).
+        # mp-mge: tool_status now probes for a bootstrapped palace on
+        # Surreal the same way it checks for chroma.sqlite3 on Chroma.
+        # To exercise the "bootstrapped but empty" path we force-bootstrap
+        # the collection first, then call status.
+        surreal_mcp._get_collection(create=True)
         r = surreal_mcp.tool_status()
-        assert "error" not in r or r.get("error") == "No palace found", r
+        assert "error" not in r, r
         assert "total_drawers" in r
+        assert r["total_drawers"] == 0
         assert isinstance(r["wings"], dict)
         assert isinstance(r["rooms"], dict)
+
+    def test_status_no_palace_returns_error(self, surreal_mcp):
+        # mp-mge: an un-bootstrapped Surreal palace must return the same
+        # "No palace found" error shape that Chroma does. Before the fix
+        # this hardcoded db_exists=True and silently returned an empty
+        # success, hiding the fact that init was never run.
+        r = surreal_mcp.tool_status()
+        assert r.get("error") == "No palace found", r
+        assert "hint" in r
 
     def test_status_after_writes(self, surreal_mcp):
         _seed_drawers(surreal_mcp)

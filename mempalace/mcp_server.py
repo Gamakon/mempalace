@@ -388,16 +388,51 @@ def _embeddings_for(texts: list) -> list:
 # ==================== READ TOOLS ====================
 
 
+def _surreal_palace_bootstrapped():
+    """Probe whether the Surreal palace is bootstrapped.
+
+    Returns True iff the target namespace/database has the drawer table
+    AND the ``palace_meta:main`` row. Mirrors the check in
+    :meth:`SurrealBackend.get_collection` so ``tool_status`` can report
+    "No palace found" the same way Chroma does when the palace has not
+    been initialized (mp-mge).
+
+    Returning ``False`` on any exception is intentional — an unreachable
+    Surreal server is operationally indistinguishable from "no palace"
+    for the purposes of this read-only probe, and the caller surfaces
+    the standard ``_no_palace()`` response.
+    """
+    try:
+        backend, palace_ref = _get_surreal_backend()
+        from .backends.surreal import _safe_db_name
+
+        db_name = _safe_db_name(palace_ref)
+        conn = backend._connect(db_name)
+        info = conn.query("INFO FOR DB") or {}
+        if isinstance(info, list):
+            info = info[0] if info else {}
+        if not isinstance(info, dict):
+            info = {}
+        tables = set((info or {}).get("tables") or {})
+        if "drawer" not in tables:
+            return False
+        return backend._palace_meta_present(conn)
+    except Exception:
+        return False
+
+
 def tool_status():
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
-    # For the Surreal backend there is no filesystem marker; tables are
-    # bootstrapped on first write via create=True, so we always pass True
-    # for the status probe (idempotent on Surreal, no-op on an already-
-    # bootstrapped palace).
+    # For the Surreal backend there is no filesystem marker: probe the DB
+    # for the drawer table + palace_meta:main row (mp-mge). If the palace
+    # has not been bootstrapped we must return the same "No palace found"
+    # error shape that the Chroma path returns — otherwise callers get a
+    # silently-empty success that hides the fact that mempalace init has
+    # not been run.
     if _config.backend == "surreal":
-        db_exists = True
+        db_exists = _surreal_palace_bootstrapped()
     else:
         db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
     col = _get_collection(create=db_exists)
