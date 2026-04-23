@@ -383,6 +383,59 @@ def cmd_migrate_kg_to_surreal(args):
         print("  OK.")
 
 
+def cmd_verify_migration(args):
+    """Run the verify-migration audit (mp-dju).
+
+    Independent of the migration code: re-reads Chroma + SQLite directly
+    and cross-checks against SurrealDB for counts, per-field payload
+    parity on a random sample, and phantom-row detection.
+
+    Exit codes (see :mod:`mempalace.verify_migration`):
+        0 clean, 1 count mismatch, 2 sample mismatch, 3 phantom rows.
+    With ``--strict`` the process also exits non-zero on any mismatch,
+    but the precedence order is unchanged — ``--strict`` just guarantees
+    we never swallow a non-clean report.
+    """
+    from .verify_migration import format_report, verify_migration
+
+    source = (
+        os.path.expanduser(args.source_palace)
+        if args.source_palace
+        else (os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path)
+    )
+    source_kg = os.path.expanduser(args.source_kg) if args.source_kg else None
+
+    try:
+        report = verify_migration(
+            source_palace=source,
+            source_kg=source_kg,
+            target_ns=args.target_ns,
+            target_db=args.target_db,
+            sample_size=args.sample_size,
+        )
+    except FileNotFoundError as e:
+        print(f"\n  {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(format_report(report))
+
+    # ``--strict`` is belt-and-suspenders: the exit code is identical to
+    # the default path (we always surface the report's code), but strict
+    # mode documents intent for CI invocations that must never treat
+    # "report and continue" as success.
+    exit_code = report.exit_code
+    if (
+        args.strict
+        and exit_code == 0
+        and (report.mismatches or report.phantom_drawers or report.phantom_triples)
+    ):
+        # Defensive: exit_code already encodes this, but keep the strict
+        # mode predictable for future code that might add non-exit-affecting
+        # warnings.
+        exit_code = 2
+    sys.exit(exit_code)
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -905,6 +958,49 @@ def main():
         help="How many random triples to round-trip verify after migration (0 disables)",
     )
 
+    # verify-migration (mp-dju) — audit a completed Chroma+SQLite -> SurrealDB migration.
+    p_verify = sub.add_parser(
+        "verify-migration",
+        help=(
+            "Audit a completed migration for counts, per-field parity, "
+            "and phantom rows (independent of the migration's own spot-check)"
+        ),
+    )
+    p_verify.add_argument(
+        "--source-palace",
+        default=None,
+        help="Chroma palace directory (default: --palace or config palace_path)",
+    )
+    p_verify.add_argument(
+        "--source-kg",
+        default=None,
+        help=(
+            "SQLite KG file path (default: ~/.mempalace/knowledge_graph.sqlite3 "
+            "if present; KG section is skipped when absent)"
+        ),
+    )
+    p_verify.add_argument(
+        "--target-ns",
+        default=None,
+        help="SurrealDB namespace (default: MEMPALACE_SURREAL_NS env or 'mempalace')",
+    )
+    p_verify.add_argument(
+        "--target-db",
+        default=None,
+        help="SurrealDB database name (default: derived from source palace path)",
+    )
+    p_verify.add_argument(
+        "--sample-size",
+        type=int,
+        default=50,
+        help="Number of random records to deep-compare field-by-field (default: 50)",
+    )
+    p_verify.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero on any mismatch (default: report and continue with exit_code)",
+    )
+
     sub.add_parser("status", help="Show what's been filed")
 
     args = parser.parse_args()
@@ -943,6 +1039,7 @@ def main():
         "migrate": cmd_migrate,
         "migrate-to-surreal": cmd_migrate_to_surreal,
         "migrate-kg-to-surreal": cmd_migrate_kg_to_surreal,
+        "verify-migration": cmd_verify_migration,
         "status": cmd_status,
     }
     dispatch[args.command](args)
