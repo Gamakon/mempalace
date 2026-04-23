@@ -58,6 +58,7 @@ from .config import (  # noqa: E402
 )
 from .version import __version__  # noqa: E402
 from .backends.chroma import ChromaBackend, ChromaCollection  # noqa: E402
+from .backends.base import PalaceRef  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
 from .palace_graph import (  # noqa: E402
@@ -95,12 +96,62 @@ if _args.palace:
     os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(_args.palace)
 
 _config = MempalaceConfig()
-# Only override KG path when --palace is explicitly provided; otherwise use
-# KnowledgeGraph's default (~/.mempalace/knowledge_graph.sqlite3).
-if _args.palace:
-    _kg = KnowledgeGraph(db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3"))
-else:
-    _kg = KnowledgeGraph()
+
+
+def _init_kg():
+    """Construct the knowledge-graph backend matching ``_config.backend``.
+
+    Chroma → SQLite ``KnowledgeGraph`` (default, path honours ``--palace``).
+    Surreal → ``KnowledgeGraphSurreal`` with connection details lifted from
+    ``MEMPALACE_SURREAL_URL/USER/PASS`` (same defaults as
+    ``backends/surreal.py``). The MCP tool surface is unchanged; handlers
+    call the same methods (``add_triple``, ``query_entity``, ``invalidate``,
+    ``timeline``, ``stats``) on whichever backend is live.
+    """
+    if _config.backend == "surreal":
+        from .kg_surreal import KnowledgeGraphSurreal
+
+        return KnowledgeGraphSurreal(
+            url=os.environ.get("MEMPALACE_SURREAL_URL", "http://127.0.0.1:8000"),
+            user=os.environ.get("MEMPALACE_SURREAL_USER", "root"),
+            password=os.environ.get("MEMPALACE_SURREAL_PASS", "root"),
+        )
+    # Only override KG path when --palace is explicitly provided; otherwise
+    # use KnowledgeGraph's default (~/.mempalace/knowledge_graph.sqlite3).
+    if _args.palace:
+        return KnowledgeGraph(db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3"))
+    return KnowledgeGraph()
+
+
+_kg = _init_kg()
+
+
+# Surreal backend instance (lazy, only created when backend == "surreal").
+_surreal_backend = None
+_surreal_palace_ref = None
+
+
+def _get_surreal_backend():
+    """Return the cached ``SurrealBackend`` + ``PalaceRef`` for this palace.
+
+    One palace per MCP server process → one PalaceRef whose ``id`` is a
+    stable hash of the palace path (Surreal uses the id as its DB name, so
+    it needs to be filesystem-independent and stable across restarts).
+    ``local_path`` carries the palace dir for adapters that want it.
+    """
+    global _surreal_backend, _surreal_palace_ref
+    if _surreal_backend is None:
+        from .backends.surreal import SurrealBackend
+
+        _surreal_backend = SurrealBackend(
+            url=os.environ.get("MEMPALACE_SURREAL_URL", "http://127.0.0.1:8000"),
+            username=os.environ.get("MEMPALACE_SURREAL_USER", "root"),
+            password=os.environ.get("MEMPALACE_SURREAL_PASS", "root"),
+        )
+    if _surreal_palace_ref is None:
+        palace_id = "mcp_" + hashlib.sha256(_config.palace_path.encode()).hexdigest()[:16]
+        _surreal_palace_ref = PalaceRef(id=palace_id, local_path=_config.palace_path)
+    return _surreal_backend, _surreal_palace_ref
 
 
 _client_cache = None
@@ -212,8 +263,35 @@ def _get_client():
 
 
 def _get_collection(create=False):
-    """Return the ChromaDB collection, caching the client between calls."""
+    """Return the active-backend drawer collection.
+
+    Backend resolution happens once per call via ``_config.backend``:
+
+    * ``chroma`` (default): opens a ``PersistentClient`` with inode/mtime
+      freshness detection (palace rebuild safety) and returns a
+      ``ChromaCollection`` wrapper.
+    * ``surreal``: returns a ``SurrealCollection`` bound to the palace's
+      Surreal DB via the long-lived ``SurrealBackend`` instance. No
+      filesystem rebuild detection — Surreal palaces live server-side.
+
+    Both paths return something implementing the RFC 001
+    ``BaseCollection`` surface (``add/upsert/update/get/query/delete/count``)
+    so every MCP tool handler below calls the same methods.
+    """
     global _collection_cache, _metadata_cache, _metadata_cache_time
+    if _config.backend == "surreal":
+        try:
+            backend, palace_ref = _get_surreal_backend()
+            _collection_cache = backend.get_collection(
+                palace=palace_ref,
+                collection_name=_config.collection_name,
+                create=create,
+            )
+            _metadata_cache = None
+            _metadata_cache_time = 0
+            return _collection_cache
+        except Exception:
+            return None
     try:
         client = _get_client()
         if create:
@@ -290,6 +368,23 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     return sanitize_name(value, field_name)
 
 
+def _embeddings_for(texts: list) -> list:
+    """Embed ``texts`` when the active backend needs explicit vectors.
+
+    Chroma's collection auto-embeds documents via its ``embedding_function``;
+    passing ``embeddings=None`` is correct there. Surreal's collection stores
+    only what it's given — no embeddings means no HNSW index gets built and
+    every subsequent vector search returns zero hits, violating the 100%
+    recall principle. Detect the backend here so the write tools stay
+    backend-agnostic at the call site.
+    """
+    if _config.backend != "surreal":
+        return None
+    from .backends.surreal import _embed_texts
+
+    return _embed_texts(list(texts))
+
+
 # ==================== READ TOOLS ====================
 
 
@@ -297,7 +392,14 @@ def tool_status():
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
-    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    # For the Surreal backend there is no filesystem marker; tables are
+    # bootstrapped on first write via create=True, so we always pass True
+    # for the status probe (idempotent on Surreal, no-op on an already-
+    # bootstrapped palace).
+    if _config.backend == "surreal":
+        db_exists = True
+    else:
+        db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
     col = _get_collection(create=db_exists)
     if not col:
         return _no_palace()
@@ -425,6 +527,79 @@ def tool_get_taxonomy():
     return result
 
 
+def _search_surreal(clean_query: str, wing, room, n_results, max_distance):
+    """Minimal direct-collection search path for the Surreal backend.
+
+    ``searcher.search_memories`` is tightly coupled to the Chroma palace
+    (filesystem path, drawer+closet hybrid). For Surreal we bypass the
+    closet hybrid and rank on raw vector distances straight from the
+    collection — the SurrealCollection already embeds texts the same way
+    Chroma does, so the returned distances are directly comparable.
+    The return shape mirrors ``search_memories`` so MCP callers see the
+    same JSON keys regardless of backend.
+    """
+    from pathlib import Path
+
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    where = None
+    conditions = []
+    if wing:
+        conditions.append({"wing": wing})
+    if room:
+        conditions.append({"room": room})
+    if len(conditions) == 1:
+        where = conditions[0]
+    elif len(conditions) > 1:
+        where = {"$and": conditions}
+
+    try:
+        kwargs = {
+            "query_texts": [clean_query],
+            "n_results": max(1, n_results),
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            kwargs["where"] = where
+        results = col.query(**kwargs)
+    except Exception as e:
+        return {"error": f"Search error: {e}"}
+
+    hits = []
+    ids_outer = results.ids or [[]]
+    docs_outer = results.documents or [[]]
+    metas_outer = results.metadatas or [[]]
+    dists_outer = results.distances or [[]]
+    if ids_outer and ids_outer[0]:
+        for doc, meta, dist in zip(docs_outer[0], metas_outer[0], dists_outer[0]):
+            if max_distance > 0.0 and dist > max_distance:
+                continue
+            meta = meta or {}
+            source = meta.get("source_file", "") or ""
+            hits.append(
+                {
+                    "text": doc,
+                    "wing": meta.get("wing", "unknown"),
+                    "room": meta.get("room", "unknown"),
+                    "source_file": Path(source).name if source else "?",
+                    "created_at": meta.get("filed_at", "unknown"),
+                    "similarity": round(max(0.0, 1 - dist), 3),
+                    "distance": round(dist, 4),
+                    "effective_distance": round(dist, 4),
+                    "closet_boost": 0.0,
+                    "matched_via": "drawer",
+                }
+            )
+
+    return {
+        "query": clean_query,
+        "count": len(hits),
+        "hits": hits,
+    }
+
+
 def tool_search(
     query: str,
     limit: int = 5,
@@ -446,14 +621,23 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
-    result = search_memories(
-        sanitized["clean_query"],
-        palace_path=_config.palace_path,
-        wing=wing,
-        room=room,
-        n_results=limit,
-        max_distance=dist,
-    )
+    if _config.backend == "surreal":
+        result = _search_surreal(
+            sanitized["clean_query"],
+            wing=wing,
+            room=room,
+            n_results=limit,
+            max_distance=dist,
+        )
+    else:
+        result = search_memories(
+            sanitized["clean_query"],
+            palace_path=_config.palace_path,
+            wing=wing,
+            room=room,
+            n_results=limit,
+            max_distance=dist,
+        )
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:
         result["query_sanitized"] = True
@@ -643,10 +827,10 @@ def tool_add_drawer(
         pass
 
     try:
-        col.upsert(
-            ids=[drawer_id],
-            documents=[content],
-            metadatas=[
+        upsert_kwargs = {
+            "ids": [drawer_id],
+            "documents": [content],
+            "metadatas": [
                 {
                     "wing": wing,
                     "room": room,
@@ -656,7 +840,11 @@ def tool_add_drawer(
                     "filed_at": datetime.now().isoformat(),
                 }
             ],
-        )
+        }
+        embeddings = _embeddings_for([content])
+        if embeddings is not None:
+            upsert_kwargs["embeddings"] = embeddings
+        col.upsert(**upsert_kwargs)
         _metadata_cache = None
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
         return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
@@ -959,10 +1147,10 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
         # semantic search quality. For now, store raw AAAK in metadata so it's
         # preserved, and keep the document as-is for embedding (even though
         # compressed AAAK degrades embedding quality).
-        col.add(
-            ids=[entry_id],
-            documents=[entry],
-            metadatas=[
+        add_kwargs = {
+            "ids": [entry_id],
+            "documents": [entry],
+            "metadatas": [
                 {
                     "wing": wing,
                     "room": room,
@@ -974,7 +1162,11 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
                     "date": now.strftime("%Y-%m-%d"),
                 }
             ],
-        )
+        }
+        embeddings = _embeddings_for([entry])
+        if embeddings is not None:
+            add_kwargs["embeddings"] = embeddings
+        col.add(**add_kwargs)
         logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
         return {
             "success": True,
