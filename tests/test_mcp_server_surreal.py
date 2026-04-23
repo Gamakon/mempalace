@@ -1,4 +1,4 @@
-"""test_mcp_server_surreal.py — MCP server <-> Surreal backend smoke tests (mp-sw5).
+"""test_mcp_server_surreal.py — MCP server <-> Surreal backend smoke tests (mp-sw5, mp-jkx).
 
 Runs the MCP server's tool handlers with ``MEMPALACE_BACKEND=surreal`` so
 the module wires up :class:`SurrealBackend` + :class:`KnowledgeGraphSurreal`
@@ -9,6 +9,10 @@ these tests swap ``_config`` / ``_kg`` in-place and reset the collection
 cache between tests — matching the pattern used in ``test_mcp_server.py``
 but pointing at Surreal. The whole file is skipped if the local Surreal
 server is not reachable.
+
+mp-jkx extends mp-sw5's initial coverage to exercise *every* MCP tool
+handler end-to-end, proving a Claude Code session using
+``MEMPALACE_BACKEND=surreal`` sees the same behaviour as against Chroma.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture()
-def surreal_mcp(monkeypatch):
+def surreal_mcp(monkeypatch, tmp_path):
     """Swap the MCP server module to use the Surreal backend + KG.
 
     * ``_config`` reports ``backend == "surreal"`` so ``_get_collection``
@@ -48,8 +52,12 @@ def surreal_mcp(monkeypatch):
     * All caches (``_collection_cache``, ``_surreal_backend``,
       ``_surreal_palace_ref``) are cleared before the test and restored
       afterwards so test order does not matter.
+    * ``palace_graph._TUNNEL_FILE`` is redirected to ``tmp_path`` so
+      tunnel tests never touch the real ``~/.mempalace/tunnels.json``.
+    * ``palace_graph`` graph cache is invalidated so a stale graph from
+      a prior test can't leak across.
     """
-    from mempalace import mcp_server
+    from mempalace import mcp_server, palace_graph
     from mempalace.backends.surreal import SurrealBackend
     from mempalace.kg_surreal import KnowledgeGraphSurreal
 
@@ -90,6 +98,15 @@ def surreal_mcp(monkeypatch):
     monkeypatch.setattr(mcp_server, "_surreal_backend", backend)
     monkeypatch.setattr(mcp_server, "_surreal_palace_ref", palace_ref)
 
+    # Redirect the on-disk tunnel store so tunnel tool tests never
+    # touch the real ``~/.mempalace/tunnels.json`` — and start empty.
+    tunnel_file = tmp_path / "tunnels.json"
+    monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", str(tunnel_file))
+
+    # Flush the module-level graph cache so a stale (nodes, edges) tuple
+    # from a previous test can't leak into this one.
+    palace_graph.invalidate_graph_cache()
+
     yield mcp_server
 
     # Tear down both the drawer namespace and the KG tables so reruns start
@@ -107,6 +124,9 @@ def surreal_mcp(monkeypatch):
         kg.close()
     except Exception:
         pass
+    # Invalidate again on the way out so the next module that runs
+    # doesn't see our in-memory Surreal-derived graph.
+    palace_graph.invalidate_graph_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -257,3 +277,371 @@ class TestSurrealDiaryTools:
             assert r["entries"] == []
         else:
             assert "error" in r or "message" in r
+
+
+# ---------------------------------------------------------------------------
+# mp-jkx: exhaustive smoke test coverage for every remaining MCP tool
+# ---------------------------------------------------------------------------
+
+
+def _seed_drawers(mcp):
+    """Populate a small multi-wing/room palace so graph/listing tools
+    have something real to walk."""
+    ids = []
+    for wing, room, content in (
+        ("project", "backend", "Postgres migration for user auth service."),
+        ("project", "frontend", "React dashboard wiring for user auth."),
+        ("notes", "backend", "Redis cache layer in front of Postgres."),
+        ("notes", "planning", "Q2 roadmap — ship auth, then billing."),
+    ):
+        r = mcp.tool_add_drawer(wing=wing, room=room, content=content)
+        assert r["success"] is True, r
+        ids.append(r["drawer_id"])
+    return ids
+
+
+class TestSurrealStatusAndCatalog:
+    """Read-only catalog tools — status / list_wings / list_rooms /
+    get_taxonomy / get_aaak_spec. Shape-only assertions plus non-error."""
+
+    def test_status_empty_palace(self, surreal_mcp):
+        # tool_status on surreal uses create=True unconditionally (mcp_server.py:399).
+        r = surreal_mcp.tool_status()
+        assert "error" not in r or r.get("error") == "No palace found", r
+        assert "total_drawers" in r
+        assert isinstance(r["wings"], dict)
+        assert isinstance(r["rooms"], dict)
+
+    def test_status_after_writes(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_status()
+        assert r["total_drawers"] >= 4
+        assert set(r["wings"].keys()) >= {"project", "notes"}
+        assert "backend" in r["rooms"]
+        # The protocol + AAAK spec must be embedded on every status call
+        # so a cold Claude session learns the dialect on wake-up.
+        assert "protocol" in r
+        assert "aaak_dialect" in r
+
+    def test_list_wings_after_writes(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_list_wings()
+        assert "error" not in r, r
+        wings = r["wings"]
+        assert wings.get("project", 0) >= 2
+        assert wings.get("notes", 0) >= 2
+
+    def test_list_rooms_all(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_list_rooms()
+        assert "error" not in r, r
+        assert r["wing"] == "all"
+        assert set(r["rooms"].keys()) >= {"backend", "frontend", "planning"}
+
+    def test_list_rooms_filtered(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_list_rooms(wing="project")
+        assert "error" not in r, r
+        assert r["wing"] == "project"
+        # Only the two project rooms should appear.
+        assert set(r["rooms"].keys()) == {"backend", "frontend"}
+
+    def test_get_taxonomy(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_get_taxonomy()
+        assert "error" not in r, r
+        tax = r["taxonomy"]
+        assert tax["project"]["backend"] >= 1
+        assert tax["notes"]["planning"] >= 1
+
+    def test_get_aaak_spec(self, surreal_mcp):
+        r = surreal_mcp.tool_get_aaak_spec()
+        assert "aaak_spec" in r
+        # Spec must reference its core primitives so the AI can decode.
+        assert "ENTITIES" in r["aaak_spec"]
+        assert "EMOTIONS" in r["aaak_spec"]
+
+
+class TestSurrealDrawerCRUD:
+    """add → get → update → list → delete round trips on the drawer table."""
+
+    def test_get_drawer_round_trip(self, surreal_mcp):
+        add = surreal_mcp.tool_add_drawer(
+            wing="project", room="api", content="GET /v1/users returns 200."
+        )
+        assert add["success"] is True
+        got = surreal_mcp.tool_get_drawer(drawer_id=add["drawer_id"])
+        assert "error" not in got, got
+        assert got["content"] == "GET /v1/users returns 200."
+        assert got["wing"] == "project"
+        assert got["room"] == "api"
+
+    def test_get_drawer_missing_id(self, surreal_mcp):
+        # Bootstrap an empty palace so the path reaches "not found" not "no palace".
+        surreal_mcp._get_collection(create=True)
+        got = surreal_mcp.tool_get_drawer(drawer_id="drawer_nope_nope_deadbeef")
+        assert "error" in got
+
+    def test_list_drawers_paginates(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_list_drawers(limit=2, offset=0)
+        assert "error" not in r, r
+        assert r["count"] == 2
+        assert r["limit"] == 2
+        assert r["offset"] == 0
+        r2 = surreal_mcp.tool_list_drawers(limit=2, offset=2)
+        assert r2["count"] >= 1
+        # No overlap between pages.
+        ids1 = {d["drawer_id"] for d in r["drawers"]}
+        ids2 = {d["drawer_id"] for d in r2["drawers"]}
+        assert ids1.isdisjoint(ids2)
+
+    def test_list_drawers_wing_room_filter(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_list_drawers(wing="project", room="backend")
+        assert "error" not in r, r
+        assert r["count"] >= 1
+        for d in r["drawers"]:
+            assert d["wing"] == "project"
+            assert d["room"] == "backend"
+
+    def test_update_drawer_content_and_metadata(self, surreal_mcp):
+        add = surreal_mcp.tool_add_drawer(wing="project", room="old_room", content="original")
+        drawer_id = add["drawer_id"]
+        upd = surreal_mcp.tool_update_drawer(
+            drawer_id=drawer_id,
+            content="updated content v2",
+            room="new_room",
+        )
+        assert upd["success"] is True, upd
+        assert upd["room"] == "new_room"
+        got = surreal_mcp.tool_get_drawer(drawer_id=drawer_id)
+        assert got["content"] == "updated content v2"
+        assert got["room"] == "new_room"
+
+    def test_update_drawer_missing_id(self, surreal_mcp):
+        surreal_mcp._get_collection(create=True)
+        r = surreal_mcp.tool_update_drawer(drawer_id="drawer_nonexistent_xyz", content="no")
+        assert r["success"] is False
+        assert "not found" in r["error"].lower()
+
+    def test_update_drawer_noop(self, surreal_mcp):
+        add = surreal_mcp.tool_add_drawer(wing="project", room="api", content="noop check")
+        r = surreal_mcp.tool_update_drawer(drawer_id=add["drawer_id"])
+        # All-None -> short-circuits to a no-op success.
+        assert r["success"] is True
+        assert r.get("noop") is True
+
+    def test_delete_drawer_round_trip(self, surreal_mcp):
+        add = surreal_mcp.tool_add_drawer(
+            wing="project", room="disposable", content="this will die"
+        )
+        did = add["drawer_id"]
+        rm = surreal_mcp.tool_delete_drawer(drawer_id=did)
+        assert rm["success"] is True, rm
+        # Second delete is a miss.
+        miss = surreal_mcp.tool_delete_drawer(drawer_id=did)
+        assert miss["success"] is False
+        assert "not found" in miss["error"].lower()
+
+    def test_check_duplicate_detects_near_identical(self, surreal_mcp):
+        surreal_mcp.tool_add_drawer(
+            wing="project",
+            room="api",
+            content="Authentication uses JWT tokens in HttpOnly cookies.",
+        )
+        r = surreal_mcp.tool_check_duplicate(
+            content="Authentication uses JWT tokens in HttpOnly cookies.",
+            threshold=0.9,
+        )
+        assert "error" not in r, r
+        assert r["is_duplicate"] is True
+        assert r["matches"], r
+
+    def test_check_duplicate_no_match(self, surreal_mcp):
+        surreal_mcp._get_collection(create=True)
+        r = surreal_mcp.tool_check_duplicate(
+            content="Totally unrelated content about volcanoes.",
+            threshold=0.99,
+        )
+        assert "error" not in r, r
+        assert r["is_duplicate"] is False
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-graph timeline (kg_add / kg_query / kg_invalidate / kg_stats
+# already covered above).
+# ---------------------------------------------------------------------------
+
+
+class TestSurrealKGTimeline:
+    def test_kg_timeline_for_entity(self, surreal_mcp):
+        surreal_mcp.tool_kg_add(
+            subject="Frank", predicate="joined", object="Acme", valid_from="2024-01-01"
+        )
+        surreal_mcp.tool_kg_add(
+            subject="Frank", predicate="promoted_to", object="VP", valid_from="2025-06-01"
+        )
+        r = surreal_mcp.tool_kg_timeline(entity="Frank")
+        assert "error" not in r, r
+        assert r["entity"] == "Frank"
+        assert r["count"] >= 2
+        preds = {f.get("predicate") for f in r["timeline"]}
+        assert {"joined", "promoted_to"} <= preds
+
+    def test_kg_timeline_all_entities(self, surreal_mcp):
+        surreal_mcp.tool_kg_add(subject="Gina", predicate="knows", object="Henry")
+        r = surreal_mcp.tool_kg_timeline()
+        assert r["entity"] == "all"
+        assert r["count"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Palace graph / tunnels
+# ---------------------------------------------------------------------------
+
+
+class TestSurrealGraphReadTools:
+    """traverse / find_tunnels / graph_stats iterate palace metadata —
+    they must walk the Surreal collection's paged get() exactly like Chroma."""
+
+    def test_graph_stats_after_writes(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_graph_stats()
+        assert "error" not in r, r
+        assert "total_rooms" in r
+        assert r["total_rooms"] >= 1
+        # "backend" is the shared room across project+notes → a real tunnel.
+        assert r["tunnel_rooms"] >= 1
+
+    def test_find_tunnels_discovers_shared_room(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_find_tunnels()
+        # shared "backend" room across project + notes should show up.
+        rooms = [t.get("room") for t in r]
+        assert "backend" in rooms, r
+
+    def test_find_tunnels_filtered_by_wings(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_find_tunnels(wing_a="project", wing_b="notes")
+        rooms = [t.get("room") for t in r]
+        assert "backend" in rooms, r
+
+    def test_traverse_known_room(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_traverse_graph(start_room="backend", max_hops=2)
+        # Happy-path traverse returns a list of hop dicts; error path returns
+        # a dict with "error". The room exists so we expect the list.
+        assert isinstance(r, list), r
+        assert any(entry.get("room") == "backend" for entry in r)
+
+    def test_traverse_unknown_room_returns_error(self, surreal_mcp):
+        _seed_drawers(surreal_mcp)
+        r = surreal_mcp.tool_traverse_graph(start_room="nonexistent-room")
+        assert isinstance(r, dict)
+        assert "error" in r
+
+
+class TestSurrealExplicitTunnels:
+    """Explicit tunnels are file-backed (tunnels.json) — backend-agnostic,
+    but we still want to confirm the full create/find/follow/delete path
+    from the MCP layer under the Surreal config."""
+
+    def test_create_list_follow_delete(self, surreal_mcp):
+        # Seed the endpoints so follow_tunnels has drawer IDs to fetch.
+        a = surreal_mcp.tool_add_drawer(
+            wing="wing_api", room="auth", content="API auth endpoint spec."
+        )
+        b = surreal_mcp.tool_add_drawer(wing="wing_db", room="users", content="Users table schema.")
+
+        created = surreal_mcp.tool_create_tunnel(
+            source_wing="wing_api",
+            source_room="auth",
+            target_wing="wing_db",
+            target_room="users",
+            label="auth reads users",
+            source_drawer_id=a["drawer_id"],
+            target_drawer_id=b["drawer_id"],
+        )
+        assert "error" not in created, created
+        assert created["label"] == "auth reads users"
+        tunnel_id = created["id"]
+
+        # list_tunnels (unfiltered + filtered by wing).
+        all_t = surreal_mcp.tool_list_tunnels()
+        assert any(t["id"] == tunnel_id for t in all_t), all_t
+        api_t = surreal_mcp.tool_list_tunnels(wing="wing_api")
+        assert any(t["id"] == tunnel_id for t in api_t), api_t
+
+        # follow_tunnels from the source endpoint.
+        follow = surreal_mcp.tool_follow_tunnels(wing="wing_api", room="auth")
+        assert isinstance(follow, list)
+        assert any(
+            c["connected_wing"] == "wing_db" and c["connected_room"] == "users" for c in follow
+        ), follow
+
+        # delete_tunnel cleans up.
+        rm = surreal_mcp.tool_delete_tunnel(tunnel_id=tunnel_id)
+        assert rm == {"deleted": tunnel_id}
+        after = surreal_mcp.tool_list_tunnels()
+        assert all(t["id"] != tunnel_id for t in after)
+
+    def test_delete_tunnel_validates_input(self, surreal_mcp):
+        r = surreal_mcp.tool_delete_tunnel(tunnel_id="")
+        assert "error" in r
+
+
+# ---------------------------------------------------------------------------
+# Hook / settings / reconnect / memories_filed_away
+# ---------------------------------------------------------------------------
+
+
+class TestSurrealHookAndSettingsTools:
+    def test_hook_settings_read_only(self, surreal_mcp):
+        # Calling with no args must just report the current state without error.
+        r = surreal_mcp.tool_hook_settings()
+        assert r["success"] is True, r
+        assert "settings" in r
+        assert "silent_save" in r["settings"]
+        assert "desktop_toast" in r["settings"]
+
+    def test_hook_settings_updates(self, surreal_mcp, tmp_path, monkeypatch):
+        # Redirect the config dir so we never mutate the real user config.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        r = surreal_mcp.tool_hook_settings(silent_save=True, desktop_toast=False)
+        assert r["success"] is True
+        assert r["settings"]["silent_save"] is True
+        assert r["settings"]["desktop_toast"] is False
+        assert "updated" in r
+
+    def test_memories_filed_away_no_checkpoint(self, surreal_mcp, tmp_path, monkeypatch):
+        # Point HOME at a clean tmp dir so the "last_checkpoint" file does
+        # not exist → the tool returns its "quiet" shape.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        r = surreal_mcp.tool_memories_filed_away()
+        assert r["status"] == "quiet"
+        assert r["count"] == 0
+        assert r["timestamp"] is None
+
+    def test_memories_filed_away_with_checkpoint(self, surreal_mcp, tmp_path, monkeypatch):
+        import json as _json
+
+        state_dir = tmp_path / ".mempalace" / "hook_state"
+        state_dir.mkdir(parents=True)
+        ack = state_dir / "last_checkpoint"
+        ack.write_text(_json.dumps({"msgs": 7, "ts": "2026-04-23T10:00:00"}))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        r = surreal_mcp.tool_memories_filed_away()
+        assert r["status"] == "ok"
+        assert r["count"] == 7
+        # File is consumed on successful read.
+        assert not ack.exists()
+
+    def test_reconnect_returns_success(self, surreal_mcp):
+        # Populate so count() returns something meaningful.
+        surreal_mcp.tool_add_drawer(
+            wing="project", room="api", content="reconnect smoke test content"
+        )
+        r = surreal_mcp.tool_reconnect()
+        assert r["success"] is True, r
+        assert r["drawers"] >= 1
