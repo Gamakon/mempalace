@@ -298,6 +298,45 @@ def _worker_reader_burst(
         queue.put({"ok": False, "crashes": [f"{e!r}\n{traceback.format_exc()}"]})
 
 
+def _worker_bootstrap_loop(
+    *,
+    namespace: str,
+    palace_id: str,
+    queue: "mp.Queue",
+) -> None:
+    """Child that runs get_collection(create=True) in a tight loop.
+
+    Used by the SIGKILL chaos test (mp-33y Task 5c). The parent kills
+    this child at a random moment so some iterations are guaranteed to
+    be cut off mid-bootstrap. The queue is mainly a liveness signal —
+    if the child ever posts before being killed, we know it reached
+    steady state.
+    """
+    try:
+        from mempalace.backends.surreal import SurrealBackend
+
+        backend = SurrealBackend(namespace=namespace)
+        try:
+            palace = PalaceRef(id=palace_id)
+            # Announce readiness BEFORE the first bootstrap so the parent
+            # knows the child is alive. Then loop — we expect to be
+            # SIGKILLed mid-iteration.
+            queue.put({"phase": "alive"})
+            while True:
+                backend.get_collection(
+                    palace=palace, collection_name="mempalace_drawers", create=True
+                )
+        finally:
+            backend.close()
+    except Exception as e:  # pragma: no cover - child is killed
+        import traceback
+
+        try:
+            queue.put({"phase": "error", "error": f"{e!r}\n{traceback.format_exc()}"})
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
@@ -383,18 +422,6 @@ def palace_id() -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=False,  # race is probabilistic (~40-60% repro); xfail-when-fails
-    reason=(
-        "mp-33y: two processes opening a fresh Surreal namespace race on "
-        "conn.use() — SurrealDB 3.x raises 'Transaction conflict: Transaction "
-        "write conflict' (code -32000) because implicit NS/DB creation is not "
-        "idempotent under concurrent USE. Threads using one shared connection "
-        "never hit this; separate processes always do. This is the exact "
-        "production failure mode (two Claude Code sessions -> two processes) "
-        "the Surreal refactor must solve. See ticket mp-33y for fix options."
-    ),
-)
 def test_two_processes_concurrent_adds_no_loss(isolated_namespace, palace_id):
     """Both children add 50 distinct drawers; parent asserts all 100 land."""
     n_each = 50
@@ -518,18 +545,6 @@ def test_two_processes_concurrent_updates_merge_correctly(isolated_namespace, pa
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=False,  # race is probabilistic; xfails-when-fails, xpasses otherwise
-    reason=(
-        "mp-33y: blocked by the same cross-process conn.use() race as "
-        "test_two_processes_concurrent_adds_no_loss. Both children hit a "
-        "fresh palace simultaneously, triggering SurrealDB's 'Transaction "
-        "write conflict' on implicit NS/DB creation BEFORE either child "
-        "reaches the embedding_dim lock this test was written to exercise. "
-        "Once mp-33y ships, this test should pass as-is and prove the "
-        "mp-hlo race-free dim lock works cross-process."
-    ),
-)
 def test_two_processes_dim_lock_race(isolated_namespace, palace_id):
     """Fresh palace; one proc writes dim-384, the other dim-768. One must fail."""
     children = [
@@ -685,6 +700,139 @@ def test_two_processes_concurrent_search_no_interference(isolated_namespace, pal
         extra = set(got.ids) - expected_ids
         assert not missing, f"missing rows after concurrent run: {sorted(missing)}"
         assert not extra, f"unexpected rows after concurrent run: {sorted(extra)}"
+    finally:
+        backend.close()
+
+
+# ---------------------------------------------------------------------------
+# 5. Four processes, 100 drawers each — hard stress (mp-33y Task 5b).
+# ---------------------------------------------------------------------------
+
+
+def test_four_processes_stress_no_loss(isolated_namespace, palace_id):
+    """Four children each add 100 drawers to a fresh palace. All 400 must land."""
+    n_each = 100
+    n_procs = 4
+    children = [
+        {
+            "target": _worker_add_drawers,
+            "kwargs": {
+                "namespace": isolated_namespace,
+                "palace_id": palace_id,
+                "id_prefix": f"p{pid}",
+                "count": n_each,
+            },
+        }
+        for pid in range(n_procs)
+    ]
+    results = _run_children(children)
+    assert len(results) == n_procs, f"expected {n_procs} child results, got {results}"
+    for r in results:
+        assert r["ok"], f"child {r.get('prefix')!r} failed: {r.get('error')}"
+
+    from mempalace.backends.surreal import SurrealBackend
+
+    backend = SurrealBackend(namespace=isolated_namespace)
+    try:
+        palace = PalaceRef(id=palace_id)
+        col = backend.get_collection(
+            palace=palace, collection_name="mempalace_drawers", create=True
+        )
+        total = col.count()
+        assert total == n_procs * n_each, f"expected {n_procs * n_each} rows, got {total}"
+        got = col.get()
+        ids_set = set(got.ids)
+        for pid in range(n_procs):
+            expected = {f"p{pid}-{i}" for i in range(n_each)}
+            missing = expected - ids_set
+            assert not missing, f"lost p{pid} ids: {sorted(missing)[:5]}..."
+    finally:
+        backend.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. Chaos: SIGKILL a bootstrapping peer, next peer must recover (mp-33y 5c).
+# ---------------------------------------------------------------------------
+
+
+def test_sigkilled_bootstrap_peer_recovers(isolated_namespace, palace_id):
+    """Kill child A mid-bootstrap; child B must still converge cleanly.
+
+    Exercises the partial-bootstrap recovery path in ``get_collection``
+    (mp-33y Task 4): if the SIGKILL lands after the DEFINE TABLE calls
+    but before ``palace_meta:main`` is UPSERTed, child B must re-run
+    bootstrap rather than treating the tables-exist observation as
+    "ready".
+    """
+    import random as _random
+    import signal
+    import time
+
+    ctx = _spawn_ctx()
+    q_a: "mp.Queue" = ctx.Queue()
+    child_a = ctx.Process(
+        target=_worker_bootstrap_loop,
+        kwargs={
+            "namespace": isolated_namespace,
+            "palace_id": palace_id,
+            "queue": q_a,
+        },
+    )
+    child_a.start()
+
+    # Let the child start but kill it at a random moment within the first
+    # 200ms. Some runs will land the SIGKILL mid-bootstrap, some after the
+    # first successful bootstrap loop iteration — both are valid chaos.
+    time.sleep(_random.uniform(0.0, 0.2))
+    try:
+        os.kill(child_a.pid, signal.SIGKILL)
+    except ProcessLookupError:  # pragma: no cover - child exited already
+        pass
+    child_a.join(timeout=5)
+    assert not child_a.is_alive(), f"child {child_a.pid} did not die from SIGKILL"
+
+    # Child B: open the same palace, add one drawer, read it back. This
+    # MUST succeed, regardless of what state child A left the catalog in.
+    q_b: "mp.Queue" = ctx.Queue()
+    child_b = ctx.Process(
+        target=_worker_add_drawers,
+        kwargs={
+            "namespace": isolated_namespace,
+            "palace_id": palace_id,
+            "id_prefix": "survivor",
+            "count": 1,
+            "queue": q_b,
+        },
+    )
+    child_b.start()
+    child_b.join(timeout=60)
+    assert not child_b.is_alive(), f"child {child_b.pid} did not exit within 60s"
+
+    results: list[dict] = []
+    while not q_b.empty():
+        results.append(q_b.get_nowait())
+    assert len(results) == 1, f"expected 1 child-B result, got {results}"
+    assert results[0]["ok"], f"child B failed after SIGKILL of A: {results[0]!r}"
+
+    # Parent-side read-back: the one drawer child B wrote must be visible
+    # AND the palace must be fully consistent (palace_meta:main row exists,
+    # tables exist, no orphan state).
+    from mempalace.backends.surreal import SurrealBackend
+
+    backend = SurrealBackend(namespace=isolated_namespace)
+    try:
+        palace = PalaceRef(id=palace_id)
+        col = backend.get_collection(
+            palace=palace, collection_name="mempalace_drawers", create=True
+        )
+        got = col.get(ids=["survivor-0"])
+        assert got.ids == ["survivor-0"], f"survivor row missing or wrong: {got!r}"
+        # palace_meta:main must exist — that's the signal the bootstrap
+        # re-run actually completed, not that we just got lucky.
+        db_name = list(backend._conns.keys())[0]
+        assert backend._palace_meta_present(backend._conns[db_name]), (
+            "palace_meta:main is missing after SIGKILL recovery"
+        )
     finally:
         backend.close()
 

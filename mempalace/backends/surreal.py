@@ -40,11 +40,14 @@ loop — mp-6xi is the thinnest layer that satisfies the base contract.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import random
 import re
+import time
 from threading import Lock
-from typing import Any, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 from .base import (
     BackendError,
@@ -82,6 +85,148 @@ class DuplicateIdError(BackendError):
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Transaction-conflict retry helper (mp-33y)
+# ---------------------------------------------------------------------------
+#
+# SurrealDB 3.0.4's storage engine is optimistic MVCC: concurrent writers
+# that touch overlapping catalog/index state can raise
+#
+#     Exception({"code": -32000, "kind": "Internal",
+#                "message": "Transaction conflict: Transaction write
+#                 conflict. This transaction can be retried"})
+#
+# This happens most visibly on the bootstrap tail (DEFINE NS/DB/TABLE/INDEX)
+# when two processes open a fresh palace simultaneously. The conflict is
+# transient and the server explicitly asks us to retry, so we do — with
+# exponential backoff + full jitter so racing peers don't resync onto the
+# same retry tick.
+#
+# Matcher rule (hardened):
+#   A conflict is either
+#     (a) args[0] is a dict with code==-32000 AND kind=="Internal" AND
+#         "conflict" in args[0].get("message", "").lower(), OR
+#     (b) "transaction write conflict" in str(exc).lower()  [fallback]
+#
+# Anything else — auth, network, schema, logic — is re-raised immediately
+# so real bugs are not masked. If we see something that *smells* like a
+# conflict (has code -32000 or the word "conflict" in the text) but does
+# NOT match the specific rule above, we log WARN + re-raise: matcher drift
+# is loud, not silent.
+
+
+F = TypeVar("F", bound=Callable)
+
+_RETRY_MAX_ATTEMPTS = 5
+_RETRY_BASE_MS = 20
+_RETRY_CAP_MS = 200
+
+
+def _extract_conflict_message(exc: BaseException) -> Optional[str]:
+    """Return the Surreal error message if ``exc`` carries a dict payload."""
+    if exc.args and isinstance(exc.args[0], dict):
+        msg = exc.args[0].get("message")
+        if isinstance(msg, str):
+            return msg
+    return None
+
+
+def _is_surreal_write_conflict(exc: BaseException) -> bool:
+    """Strict matcher for SurrealDB transaction-write-conflict errors.
+
+    Returns True only when the exception matches the documented shape or
+    a ``"transaction write conflict"`` substring in its ``str()`` form.
+    """
+    if exc.args and isinstance(exc.args[0], dict):
+        payload = exc.args[0]
+        code = payload.get("code")
+        kind = payload.get("kind")
+        message = payload.get("message", "")
+        if (
+            code == -32000
+            and kind == "Internal"
+            and isinstance(message, str)
+            and "conflict" in message.lower()
+        ):
+            return True
+    return "transaction write conflict" in str(exc).lower()
+
+
+def _looks_conflict_ish(exc: BaseException) -> bool:
+    """Loose "smells like a conflict" probe used for matcher-drift warnings.
+
+    Fires when either the error payload has ``code == -32000`` or the
+    text contains the word ``"conflict"``. The strict matcher
+    :func:`_is_surreal_write_conflict` is then the canonical decision
+    about whether to retry; if this loose probe fires but the strict
+    matcher does not, we log and re-raise so the drift surfaces.
+    """
+    if exc.args and isinstance(exc.args[0], dict):
+        if exc.args[0].get("code") == -32000:
+            return True
+    return "conflict" in str(exc).lower()
+
+
+def _retry_on_conflict(fn: F, *, op_name: Optional[str] = None) -> F:
+    """Wrap ``fn`` so that Surreal transaction-write conflicts trigger a
+    bounded exponential-backoff retry loop (mp-33y).
+
+    Usage either as a decorator (``@_retry_on_conflict``) or ad-hoc via
+    ``_retry_on_conflict(lambda: do_it(), op_name="ensure_bootstrap")()``.
+
+    ``op_name`` is included in any log lines so we can tell which site is
+    flapping. If omitted, the wrapped function's ``__name__`` is used.
+
+    Policy (per the mp-33y brief):
+      * 5 attempts max.
+      * Sleep ``random.uniform(0, min(20 * 2**n, 200))`` ms between tries
+        (full jitter, base 20ms, cap 200ms).
+      * Only retry on conflicts. Anything else is re-raised immediately.
+      * On exhaustion, re-raise the last exception unwrapped.
+    """
+    label = op_name or getattr(fn, "__name__", "<fn>")
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        last_exc: BaseException | None = None
+        for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                if _is_surreal_write_conflict(e):
+                    last_exc = e
+                    if attempt == _RETRY_MAX_ATTEMPTS:
+                        break
+                    ceiling = min(_RETRY_CAP_MS, _RETRY_BASE_MS * (2 ** (attempt - 1)))
+                    sleep_ms = random.uniform(0, ceiling)
+                    logger.debug(
+                        "mp-33y retry %d/%d for %s after %.1fms (write conflict)",
+                        attempt,
+                        _RETRY_MAX_ATTEMPTS,
+                        label,
+                        sleep_ms,
+                    )
+                    time.sleep(sleep_ms / 1000.0)
+                    continue
+                # Not our conflict. If it *looks* like one but missed the
+                # strict matcher, scream loudly so matcher drift is not
+                # silently swallowed.
+                if _looks_conflict_ish(e):
+                    logger.warning(
+                        "mp-33y matcher drift in %s: conflict-ish exception "
+                        "did not match the strict matcher; re-raising. exc=%r",
+                        label,
+                        e,
+                    )
+                raise
+        # Exhausted — re-raise the last conflict so the caller sees it.
+        assert last_exc is not None
+        raise last_exc
+
+    return wrapper  # type: ignore[return-value]
+
 
 DEFAULT_URL = os.environ.get("MEMPALACE_SURREAL_URL", "http://127.0.0.1:8000")
 DEFAULT_USER = os.environ.get("MEMPALACE_SURREAL_USER", "root")
@@ -437,55 +582,76 @@ class SurrealCollection(BaseCollection):
         here (the old behaviour) violates the 100% recall principle by
         turning every subsequent vector query into a zero-row return
         (mp-o7v).
+
+        The full body is wrapped in :func:`_retry_on_conflict` (mp-33y)
+        because SurrealDB's catalog DDL can surface a transient
+        transaction-write-conflict under concurrent first-writers. All
+        DB statements involved are idempotent (conditional UPDATE,
+        plain SELECT, DEFINE INDEX IF NOT EXISTS), so retrying the
+        whole method is safe — in particular, a partial previous
+        attempt that already locked the dim does not change observable
+        behaviour when we retry with the same ``observed_dim``.
         """
         if self._hnsw_checked:
             return
-        index_name = f"{self._table}_vec"
-        observed = int(observed_dim)
 
-        # Race-free dim lock (mp-hlo): only set embedding_dim when it is
-        # still NONE. Concurrent writers with different dims will observe
-        # the winner's value on read-back and raise DimensionMismatchError.
-        try:
-            self._db.query(
-                "UPDATE palace_meta:main SET embedding_dim = $d WHERE embedding_dim IS NONE;",
-                {"d": observed},
+        def _do() -> None:
+            index_name = f"{self._table}_vec"
+            observed = int(observed_dim)
+
+            # Race-free dim lock (mp-hlo): only set embedding_dim when it
+            # is still NONE. Concurrent writers with different dims will
+            # observe the winner's value on read-back and raise
+            # DimensionMismatchError.
+            try:
+                self._db.query(
+                    "UPDATE palace_meta:main SET embedding_dim = $d WHERE embedding_dim IS NONE;",
+                    {"d": observed},
+                )
+                rows = self._db.query("SELECT embedding_dim FROM palace_meta:main;")
+            except Exception as e:
+                if _is_surreal_write_conflict(e):
+                    # Let the retry wrapper handle it.
+                    raise
+                raise HnswIndexCreationError(
+                    f"failed to lock embedding_dim for {self._table!r}: {e}"
+                ) from e
+
+            stored_dim: Optional[int] = None
+            if rows:
+                row = rows[0] if isinstance(rows, list) else rows
+                if isinstance(row, dict) and isinstance(row.get("embedding_dim"), int):
+                    stored_dim = row["embedding_dim"]
+            if stored_dim is not None and stored_dim != observed:
+                # Do NOT set _hnsw_checked — the caller's write is invalid
+                # but the process is free to retry with the correct dim.
+                raise DimensionMismatchError(
+                    f"palace embedding_dim is {stored_dim} but write uses dim {observed}"
+                )
+
+            # Define the HNSW index itself. IF NOT EXISTS makes this
+            # idempotent across concurrent first-writers; the dim baked in
+            # by the winner wins, and because we already agreed on
+            # ``observed == stored_dim`` both processes pass through
+            # cleanly.
+            ddl = (
+                f"DEFINE INDEX IF NOT EXISTS {index_name} ON {self._table} "
+                f"FIELDS embedding HNSW DIMENSION {observed} "
+                f"DIST COSINE M 16 EFC 150;"
             )
-            rows = self._db.query("SELECT embedding_dim FROM palace_meta:main;")
-        except Exception as e:
-            raise HnswIndexCreationError(
-                f"failed to lock embedding_dim for {self._table!r}: {e}"
-            ) from e
+            try:
+                self._db.query(ddl)
+            except Exception as e:
+                if _is_surreal_write_conflict(e):
+                    raise
+                # Silent swallow here means every vector query returns zero
+                # rows for the life of this process. Raise instead so the
+                # caller can retry or fail fast (mp-o7v).
+                raise HnswIndexCreationError(
+                    f"failed to create HNSW index {index_name!r}: {e}"
+                ) from e
 
-        stored_dim: Optional[int] = None
-        if rows:
-            row = rows[0] if isinstance(rows, list) else rows
-            if isinstance(row, dict) and isinstance(row.get("embedding_dim"), int):
-                stored_dim = row["embedding_dim"]
-        if stored_dim is not None and stored_dim != observed:
-            # Do NOT set _hnsw_checked — the caller's write is invalid but
-            # the process is free to retry with the correct dim.
-            raise DimensionMismatchError(
-                f"palace embedding_dim is {stored_dim} but write uses dim {observed}"
-            )
-
-        # Define the HNSW index itself. IF NOT EXISTS makes this idempotent
-        # across concurrent first-writers; the dim baked in by the winner
-        # wins, and because we already agreed on `observed == stored_dim`
-        # both processes pass through cleanly.
-        ddl = (
-            f"DEFINE INDEX IF NOT EXISTS {index_name} ON {self._table} "
-            f"FIELDS embedding HNSW DIMENSION {observed} "
-            f"DIST COSINE M 16 EFC 150;"
-        )
-        try:
-            self._db.query(ddl)
-        except Exception as e:
-            # Silent swallow here means every vector query returns zero
-            # rows for the life of this process. Raise instead so the
-            # caller can retry or fail fast (mp-o7v).
-            raise HnswIndexCreationError(f"failed to create HNSW index {index_name!r}: {e}") from e
-
+        _retry_on_conflict(_do, op_name="_ensure_hnsw_index")()
         self._hnsw_checked = True
 
     def _record_payload(
@@ -1418,7 +1584,22 @@ class SurrealBackend(BaseBackend):
     # ------------------------------------------------------------------
 
     def _connect(self, db_name: str):
-        """Open or reuse a Surreal connection bound to ``db_name``."""
+        """Open or reuse a Surreal connection bound to ``db_name``.
+
+        Creates the namespace and database up-front with explicit
+        ``DEFINE ... IF NOT EXISTS`` statements before ``conn.use(ns, db)``
+        (mp-33y). SurrealDB's implicit NS/DB creation on ``USE`` is not
+        idempotent under concurrent processes and raises
+        ``"Transaction conflict: Transaction write conflict"`` when two
+        fresh peers race. Running the DEFINEs first eliminates that race
+        (19/20 conflicts observed in the preflight repro drop to 0/20
+        with this ordering).
+
+        The whole open-and-bootstrap-NS/DB sequence is additionally wrapped
+        in :func:`_retry_on_conflict` to cover the residual catalog-tail
+        race surfaced by Surreal issues #6681 / #7009 / #7071 / #7072 —
+        idempotent DDL means a retry always starts from a clean slate.
+        """
         if self._closed:
             from .base import BackendClosedError
 
@@ -1429,11 +1610,27 @@ class SurrealBackend(BaseBackend):
             if conn is not None:
                 return conn
 
-            from surrealdb import Surreal  # late import
+            def _do_connect():
+                from surrealdb import Surreal  # late import
 
-            conn = Surreal(self._url)
-            conn.signin({"username": self._username, "password": self._password})
-            conn.use(self._namespace, db_name)
+                ns = self._namespace
+                new_conn = Surreal(self._url)
+                new_conn.signin({"username": self._username, "password": self._password})
+                # mp-33y: create NS + DB explicitly before USE. Identifiers
+                # are already sanitised (``_safe_db_name``) and ``ns`` comes
+                # from a caller-controlled string that we do not further
+                # sanitise here — callers upstream are responsible for
+                # passing a safe namespace, matching the existing contract
+                # of ``SurrealBackend(namespace=...)``.
+                new_conn.query(
+                    f"DEFINE NAMESPACE IF NOT EXISTS {ns}; "
+                    f"USE NS {ns}; "
+                    f"DEFINE DATABASE IF NOT EXISTS {db_name};"
+                )
+                new_conn.use(ns, db_name)
+                return new_conn
+
+            conn = _retry_on_conflict(_do_connect, op_name="_connect")()
             self._conns[db_name] = conn
             return conn
 
@@ -1452,18 +1649,52 @@ class SurrealBackend(BaseBackend):
         ``options={"embedding_dim": ...}`` — pre-seeds the field; subsequent
         writes with a different dim raise
         :class:`DimensionMismatchError`.
+
+        The DDL body uses ``DEFINE ... IF NOT EXISTS`` for every table,
+        field, analyzer, and index, plus ``UPSERT palace_meta:main`` for
+        the metadata row, so the statement batch is fully idempotent —
+        running it twice is a no-op. That is what makes it safe to wrap
+        in :func:`_retry_on_conflict` (mp-33y): a retry always starts
+        from a clean slate, never from a partially-applied state.
         """
         with self._lock:
             tables = self._bootstrapped.setdefault(db_name, set())
             if "drawer" in tables and "closet" in tables:
                 return
-        conn.query(_bootstrap_ddl(embedding_dim))
+
+        ddl = _bootstrap_ddl(embedding_dim)
+        _retry_on_conflict(lambda: conn.query(ddl), op_name="_ensure_bootstrap")()
+
         with self._lock:
             self._bootstrapped[db_name].update({"drawer", "closet"})
 
     # ------------------------------------------------------------------
     # BaseBackend surface
     # ------------------------------------------------------------------
+
+    def _palace_meta_present(self, conn) -> bool:
+        """Return True iff ``palace_meta:main`` exists in the current DB.
+
+        Used by :meth:`get_collection` to distinguish a fully bootstrapped
+        palace from one whose bootstrap was interrupted (e.g. a SIGKILLed
+        peer landed the DEFINE TABLE calls but died before the
+        ``UPSERT palace_meta:main`` statement completed). See mp-33y
+        Task 4.
+
+        Wrapped in the conflict retry helper because under concurrent
+        first-writers this read can race with catalog DDL and flap.
+        """
+        try:
+            rows = _retry_on_conflict(
+                lambda: conn.query("SELECT id FROM palace_meta:main;"),
+                op_name="_palace_meta_present",
+            )()
+        except Exception:  # pragma: no cover - defensive
+            return False
+        if not rows:
+            return False
+        row = rows[0] if isinstance(rows, list) else rows
+        return isinstance(row, dict) and bool(row)
 
     def get_collection(
         self,
@@ -1480,10 +1711,21 @@ class SurrealBackend(BaseBackend):
 
         conn = self._connect(db_name)
 
-        # Detect "does the palace exist?" via a cheap INFO query.
-        info = conn.query("INFO FOR DB") or {}
+        # Detect "does the palace exist?" via a cheap INFO query. The
+        # high-level SDK passes server-side error strings through as the
+        # return value (rather than raising), so be defensive about the
+        # shape — if we see a non-dict we treat the palace as "not yet
+        # bootstrapped" and let the create-path run. Also wrap in the
+        # conflict retry helper: under concurrent first-writers the
+        # INFO read can coincide with catalog DDL and flap. (mp-33y)
+        def _info_for_db():
+            return conn.query("INFO FOR DB")
+
+        info = _retry_on_conflict(_info_for_db, op_name="get_collection.info")() or {}
         if isinstance(info, list):
             info = info[0] if info else {}
+        if not isinstance(info, dict):
+            info = {}
         existing_tables = set((info or {}).get("tables") or {})
 
         palace_present = "drawer" in existing_tables or "closet" in existing_tables
@@ -1497,6 +1739,35 @@ class SurrealBackend(BaseBackend):
             embedding_dim: Optional[int] = None
             if options and isinstance(options, dict) and "embedding_dim" in options:
                 embedding_dim = int(options["embedding_dim"])
+
+            # Partial-bootstrap detection (mp-33y Task 4). The cross-process
+            # bootstrap can leave a palace with drawer/closet tables but no
+            # palace_meta:main row if a peer was SIGKILLed mid-sequence.
+            # Rules:
+            #   * neither tables nor meta       -> full bootstrap (normal path)
+            #   * tables AND meta               -> ready, bootstrap is a no-op
+            #   * tables BUT no meta            -> incomplete; re-run bootstrap
+            #     (idempotent DDL + UPSERT; see _ensure_bootstrap docstring)
+            #   * meta BUT no tables            -> unexpected; raise
+            meta_present = self._palace_meta_present(conn) if palace_present else False
+            if palace_present and not meta_present:
+                # Drop any cached "bootstrapped" flag so we genuinely re-run
+                # the DDL batch — caches from a prior in-process run don't
+                # reflect the reality of the crashed peer.
+                logger.warning(
+                    "mp-33y: palace %r has tables but no palace_meta:main row; "
+                    "re-running bootstrap to recover from an interrupted peer.",
+                    db_name,
+                )
+                with self._lock:
+                    self._bootstrapped.pop(db_name, None)
+            elif meta_present and not palace_present:
+                raise BackendError(
+                    f"surreal palace {db_name!r} has palace_meta:main but no "
+                    "drawer/closet tables — refusing to proceed from an "
+                    "inconsistent state."
+                )
+
             self._ensure_bootstrap(db_name, conn, embedding_dim=embedding_dim)
 
         return SurrealCollection(conn, table)
