@@ -31,10 +31,11 @@ The index is structured — people and projects become *wings*, topics
 become *rooms*, and original content lives in *drawers* — so searches
 can be scoped rather than run against a flat corpus.
 
-The retrieval layer is pluggable. The current default is ChromaDB; the
-interface is defined in [`mempalace/backends/base.py`](mempalace/backends/base.py)
-and alternative backends can be dropped in without touching the rest of
-the system.
+The retrieval layer is pluggable. The current default is ChromaDB; a
+[SurrealDB backend](docs/surrealdb-local.md) ships in-tree for
+multi-process / concurrent-writer setups. The interface is defined in
+[`mempalace/backends/base.py`](mempalace/backends/base.py) and alternative
+backends can be dropped in without touching the rest of the system.
 
 Nothing leaves your machine unless you opt in.
 
@@ -149,12 +150,35 @@ system prompt:
 Two Claude Code hooks save periodically and before context compression:
 [mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html).
 
+## Multi-process / team use
+
+The default Chroma backend uses a single-writer SQLite lock — fine for a
+single MCP/CLI process at a time. When multiple Claude Code sessions,
+agents, or hooks may write to the same palace concurrently, switch to the
+**SurrealDB backend**, which supports multi-process concurrent writes:
+
+```bash
+export MEMPALACE_BACKEND=surreal
+# or set "backend": "surreal" in ~/.mempalace/config.json
+```
+
+Local server setup: [`docs/surrealdb-local.md`](docs/surrealdb-local.md).
+Existing Chroma palaces migrate in place with:
+
+```bash
+mempalace migrate-to-surreal --include-kg     # drawers + knowledge graph
+mempalace verify-migration                    # audit parity after migration
+```
+
+Large palaces (100k+ drawers) complete successfully; the HNSW rebuild at
+that scale is a known SurrealDB scaling behavior and may take time.
+
 ---
 
 ## Requirements
 
 - Python 3.9+
-- A vector-store backend (ChromaDB by default)
+- A vector-store backend (ChromaDB by default; SurrealDB optional for concurrent writes)
 - ~300 MB disk for the default embedding model
 
 No API key is required for the core benchmark path.

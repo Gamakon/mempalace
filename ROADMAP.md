@@ -28,13 +28,20 @@ The v4 alpha introduces three major capabilities: pluggable storage backends, lo
 
 ### Swappable Storage
 
-ChromaDB remains the default, but v4 introduces a backend abstraction (shipped in #413) that enables drop-in replacements:
+ChromaDB remains the default, but v4 introduces a backend abstraction (shipped in #413) that enables drop-in replacements.
 
-- **PostgreSQL backend** with pg_sorted_heap support (#665) — for production deployments needing ACID guarantees, concurrent access, and standard backup/restore
+**Shipped:**
+
+- **SurrealDB backend** (mp-a7r, mp-ciw, mp-3lc, mp-dju, mp-rta) — local embedded `surrealkv` backend for drawers and the knowledge graph, with **multi-process concurrent writes** (the original motivation: Chroma's single-writer SQLite lock). Opt in via `MEMPALACE_BACKEND=surreal` or `~/.mempalace/config.json`. Migration tooling: `mempalace migrate-to-surreal [--include-kg] [--sqlite-direct]`, `mempalace migrate-kg-to-surreal`, `mempalace verify-migration`. Full test parity with Chroma. See [`docs/surrealdb-local.md`](docs/surrealdb-local.md).
+
+**Under consideration:**
+
 - **LanceDB backend** (#574) — for local-first deployments wanting multi-device sync without a database server
 - **PalaceStore** (#643) — bespoke storage layer purpose-built for MemPalace's access patterns (draft, evaluating)
 
-Users choose their backend at init time. Existing ChromaDB palaces continue to work unchanged.
+Users choose their backend via env var or config. Existing ChromaDB palaces continue to work unchanged; migration to Surreal is optional and reversible (the original Chroma data is preserved).
+
+Note: concurrent-access support is no longer a roadmap item — it ships today via the Surreal backend. A separate PostgreSQL backend is not on the near-term roadmap.
 
 ### Local NLP
 

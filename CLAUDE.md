@@ -42,8 +42,11 @@ pip install -e ".[dev]"
 ## Commands
 
 ```bash
-# Run tests
+# Run tests (default: Chroma backend)
 python -m pytest tests/ -v --ignore=tests/benchmarks
+
+# Run tests against the Surreal backend
+MEMPALACE_BACKEND=surreal python -m pytest tests/ -v --ignore=tests/benchmarks
 
 # Run tests with coverage
 python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing
@@ -56,6 +59,12 @@ ruff format .
 
 # Format check (CI mode)
 ruff format --check .
+
+# Migrate an existing Chroma palace to Surreal (drawers + KG)
+mempalace migrate-to-surreal --include-kg
+mempalace migrate-to-surreal --sqlite-direct   # for palaces with corrupt/huge HNSW
+mempalace migrate-kg-to-surreal                # KG only
+mempalace verify-migration                      # audit a completed migration
 ```
 
 ## Project Structure
@@ -68,12 +77,15 @@ mempalace/
 ├── miner.py             # Project file miner
 ├── convo_miner.py       # Conversation transcript miner
 ├── searcher.py          # Semantic search (hybrid BM25 + vector)
-├── knowledge_graph.py   # Temporal entity-relationship graph (SQLite)
+├── knowledge_graph.py   # Temporal entity-relationship graph (SQLite, Chroma backend)
+├── kg_surreal.py        # Knowledge graph on SurrealDB (Surreal backend)
 ├── palace.py            # Shared palace operations
 ├── palace_graph.py      # Room traversal + cross-wing tunnels
-├── backends/            # Pluggable storage backends (ChromaDB default)
+├── backends/            # Pluggable storage backends (Chroma default, Surreal opt-in)
 │   ├── base.py          # Abstract interface — implement this for new backends
-│   └── chroma.py        # ChromaDB implementation
+│   ├── registry.py      # Backend resolution (env var + config field)
+│   ├── chroma.py        # ChromaDB implementation (single-writer)
+│   └── surreal.py       # SurrealDB implementation (multi-process concurrent writes)
 ├── dialect.py           # AAAK compression dialect
 ├── normalize.py         # Transcript format detection + normalization
 ├── entity_detector.py   # Auto-detect people/projects from content
@@ -82,7 +94,9 @@ mempalace/
 ├── onboarding.py        # Interactive first-run setup
 ├── repair.py            # Palace repair and consistency checks
 ├── dedup.py             # Deduplication
-├── migrate.py           # ChromaDB version migration
+├── migrate.py           # Chroma -> Surreal drawer migration + ChromaDB version migration
+├── migrate_kg.py        # SQLite KG -> Surreal KG migration
+├── verify_migration.py  # Post-migration audit (drawer + KG parity)
 ├── spellcheck.py        # Auto-correct user messages
 ├── exporter.py          # Palace data export
 ├── hooks_cli.py         # Hook management CLI
@@ -107,8 +121,8 @@ hooks/                   # Claude Code hook scripts
 ## Architecture
 
 ```
-User → CLI / MCP Server → Storage Backend (ChromaDB default, pluggable)
-                        → SQLite (knowledge graph)
+User → CLI / MCP Server → Storage Backend (Chroma default; Surreal for concurrent writes)
+                        → Knowledge graph (SQLite on Chroma; SurrealDB on Surreal)
 
 Palace structure:
   WING (person/project)
@@ -131,3 +145,21 @@ Knowledge Graph:
 - **Adding a storage backend**: subclass `mempalace/backends/base.py`, register in `backends/__init__.py`
 - **Input validation**: `mempalace/config.py` — `sanitize_name()` / `sanitize_content()`
 - **Tests**: mirror source structure in `tests/test_<module>.py`
+
+## Backends
+
+MemPalace has a pluggable backend layer. Two backends ship in-tree:
+
+- **Chroma** (default) — ChromaDB + SQLite KG. Simplest install, single-writer. Fine for one MCP/CLI process at a time.
+- **Surreal** — SurrealDB (local, embedded `surrealkv`) for drawers and KG. Supports **multi-process concurrent writes**, which Chroma's SQLite lock does not. Recommended when multiple Claude Code sessions, agents, or hooks may write simultaneously.
+
+Select a backend (resolution order: env var -> config file -> default):
+
+```bash
+export MEMPALACE_BACKEND=surreal     # or: chroma
+# or set "backend": "surreal" in ~/.mempalace/config.json
+```
+
+Local Surreal server setup: see [`docs/surrealdb-local.md`](docs/surrealdb-local.md). Migration from an existing Chroma palace uses `mempalace migrate-to-surreal --include-kg` (see Commands).
+
+Test parity: full suite passes against both backends (`MEMPALACE_BACKEND=surreal` to force Surreal).
