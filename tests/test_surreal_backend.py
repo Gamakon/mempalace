@@ -16,8 +16,10 @@ import uuid
 import pytest
 
 from mempalace.backends import (
+    DimensionMismatchError,
     GetResult,
     PalaceRef,
+    QueryResult,
     UnsupportedFilterError,
 )
 
@@ -325,14 +327,268 @@ def test_limit_and_offset(drawer_collection):
 
 
 # ---------------------------------------------------------------------------
-# query() NotImplementedError gate for mp-j19
+# query() — hybrid BM25 + vector (mp-j19)
 # ---------------------------------------------------------------------------
 
 
-def test_query_raises_not_implemented_pointing_at_mp_j19(drawer_collection):
-    with pytest.raises(NotImplementedError) as exc_info:
-        drawer_collection.query(query_texts=["anything"])
-    assert "mp-j19" in str(exc_info.value)
+def _seed_vector_corpus(collection):
+    """Seed a small 3-dim vector corpus for deterministic KNN assertions.
+
+    Vectors are laid out so that ``[1.0, 0.0, 0.0]`` cleanly prefers ``v1``
+    (same direction), ``[0.0, 1.0, 0.0]`` prefers ``v2``, etc. — no ties.
+    """
+    collection.add(
+        documents=[
+            "the quick brown fox jumps over the lazy dog",
+            "a second document about cats and birds",
+            "machine learning pipelines use vector embeddings",
+            "totally unrelated content about baking bread",
+        ],
+        ids=["v1", "v2", "v3", "v4"],
+        metadatas=[
+            {"wing": "w1", "room": "r1"},
+            {"wing": "w2", "room": "r1"},
+            {"wing": "w1", "room": "r2"},
+            {"wing": "w3", "room": "r3"},
+        ],
+        embeddings=[
+            [0.9, 0.1, 0.1],
+            [0.1, 0.9, 0.1],
+            [0.1, 0.1, 0.9],
+            [0.5, 0.5, 0.5],
+        ],
+    )
+
+
+def test_query_vector_only_returns_typed_shape(drawer_collection):
+    """Pure vector path: query_embeddings -> HNSW KNN, QueryResult shape."""
+    _seed_vector_corpus(drawer_collection)
+
+    result = drawer_collection.query(
+        query_embeddings=[[1.0, 0.0, 0.0]],
+        n_results=2,
+    )
+    assert isinstance(result, QueryResult)
+    # Outer dim = 1 query, inner dim = up to n_results hits.
+    assert len(result.ids) == 1
+    assert len(result.ids[0]) == 2
+    # v1 has embedding [0.9, 0.1, 0.1] — closest to [1.0, 0.0, 0.0].
+    assert result.ids[0][0] == "v1"
+    assert result.documents[0][0].startswith("the quick brown")
+    # Distances are cosine-like: closer = smaller.
+    assert result.distances[0][0] <= result.distances[0][1]
+
+
+def test_query_vector_respects_where_filter(drawer_collection):
+    _seed_vector_corpus(drawer_collection)
+    result = drawer_collection.query(
+        query_embeddings=[[1.0, 0.0, 0.0]],
+        n_results=5,
+        where={"wing": "w1"},
+    )
+    # Only v1 and v3 are in wing w1.
+    assert set(result.ids[0]) == {"v1", "v3"}
+
+
+def test_query_vector_multi_query_outer_dim(drawer_collection):
+    _seed_vector_corpus(drawer_collection)
+    result = drawer_collection.query(
+        query_embeddings=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        n_results=1,
+    )
+    # Two queries -> outer dim 2, each with 1 hit.
+    assert len(result.ids) == 2
+    assert result.ids[0][0] == "v1"
+    assert result.ids[1][0] == "v2"
+
+
+def test_query_vector_dim_mismatch_raises(drawer_collection):
+    _seed_vector_corpus(drawer_collection)
+    with pytest.raises(DimensionMismatchError):
+        drawer_collection.query(
+            query_embeddings=[[1.0, 0.0]],  # wrong dim (2 vs. 3)
+            n_results=1,
+        )
+
+
+def test_query_empty_collection_returns_empty_inner(drawer_collection):
+    """Querying before anything is inserted must not crash — empty inner lists."""
+    # Force-create the HNSW index with a throwaway write we then delete so the
+    # index exists but the row set is empty.
+    drawer_collection.add(
+        documents=["temp"],
+        ids=["temp_id"],
+        embeddings=[[0.1, 0.2, 0.3]],
+    )
+    drawer_collection.delete(ids=["temp_id"])
+    result = drawer_collection.query(
+        query_embeddings=[[1.0, 0.0, 0.0]],
+        n_results=5,
+    )
+    assert result.ids == [[]]
+    assert result.documents == [[]]
+    assert result.distances == [[]]
+
+
+def test_query_bm25_only_via_where_document_search(drawer_collection):
+    """where_document={'$search': ...} promotes to BM25-only full-text."""
+    _seed_vector_corpus(drawer_collection)
+    # Top up with extra docs so BM25 idf actually scores non-zero.
+    drawer_collection.add(
+        documents=[
+            "filler document about gardening",
+            "another filler talking about cooking",
+            "unrelated filler covering travel",
+        ],
+        ids=["f1", "f2", "f3"],
+        embeddings=[[0.2, 0.2, 0.2], [0.3, 0.3, 0.3], [0.4, 0.4, 0.4]],
+    )
+    result = drawer_collection.query(
+        query_texts=["brown"],
+        where_document={"$search": "brown"},
+        n_results=5,
+    )
+    assert "v1" in result.ids[0]
+    # Highest-scoring doc is v1 ("brown fox"); pseudo-distance strictly < 1.
+    idx = result.ids[0].index("v1")
+    assert result.distances[0][idx] < 1.0
+
+
+def test_query_bm25_ranks_by_score(drawer_collection):
+    """BM25 path returns rows ordered best-score first (lowest pseudo-dist)."""
+    _seed_vector_corpus(drawer_collection)
+    drawer_collection.add(
+        documents=["pad one", "pad two", "pad three", "pad four"],
+        ids=["p1", "p2", "p3", "p4"],
+        embeddings=[[0.1, 0.1, 0.1]] * 4,
+    )
+    result = drawer_collection.query(
+        query_texts=["machine"],
+        where_document={"$search": "machine"},
+        n_results=3,
+    )
+    # v3's document contains "machine" — expect it first.
+    assert result.ids[0][0] == "v3"
+    # Distances must be monotonically non-decreasing (best first).
+    dists = result.distances[0]
+    assert all(a <= b for a, b in zip(dists, dists[1:]))
+
+
+def test_query_requires_exactly_one_input(drawer_collection):
+    with pytest.raises(ValueError):
+        drawer_collection.query()
+    with pytest.raises(ValueError):
+        drawer_collection.query(query_texts=[], query_embeddings=None)
+    with pytest.raises(ValueError):
+        drawer_collection.query(query_texts=["foo"], query_embeddings=[[0.1, 0.2, 0.3]])
+
+
+def test_query_with_include_distances_embeddings(drawer_collection):
+    _seed_vector_corpus(drawer_collection)
+    result = drawer_collection.query(
+        query_embeddings=[[1.0, 0.0, 0.0]],
+        n_results=1,
+        include=["documents", "metadatas", "distances", "embeddings"],
+    )
+    assert result.embeddings is not None
+    assert len(result.embeddings) == 1
+    assert len(result.embeddings[0]) == 1
+    assert len(result.embeddings[0][0]) == 3
+
+
+def test_query_include_omits_unrequested_fields(drawer_collection):
+    _seed_vector_corpus(drawer_collection)
+    result = drawer_collection.query(
+        query_embeddings=[[1.0, 0.0, 0.0]],
+        n_results=1,
+        include=["documents"],
+    )
+    # documents requested, metadatas/distances/embeddings not.
+    assert result.documents[0]
+    assert result.metadatas == [[]]
+    assert result.distances == [[]]
+    assert result.embeddings is None
+
+
+def test_query_search_on_get_path_raises(drawer_collection):
+    """``$search`` only makes sense on query(); get()/delete() must reject it."""
+    drawer_collection.add(documents=["x"], ids=["id"])
+    with pytest.raises(UnsupportedFilterError):
+        drawer_collection.get(where_document={"$search": "x"})
+
+
+def test_query_various_n_results(drawer_collection):
+    """n_results bounds the inner list length; asking for more than present
+    should return what exists, never crash (parity with Chroma)."""
+    _seed_vector_corpus(drawer_collection)
+    # 4 docs seeded; ask for 10.
+    result = drawer_collection.query(
+        query_embeddings=[[1.0, 0.0, 0.0]],
+        n_results=10,
+    )
+    assert len(result.ids[0]) == 4
+    # And ask for 1 — only the best match.
+    result = drawer_collection.query(
+        query_embeddings=[[1.0, 0.0, 0.0]],
+        n_results=1,
+    )
+    assert len(result.ids[0]) == 1
+    assert result.ids[0][0] == "v1"
+
+
+def test_query_hybrid_where_and_search(drawer_collection):
+    """BM25 path must respect a ``where=`` metadata filter alongside $search."""
+    _seed_vector_corpus(drawer_collection)
+    drawer_collection.add(
+        documents=["machine model in wing w3", "ignore this one"],
+        ids=["m1", "m2"],
+        metadatas=[{"wing": "w3"}, {"wing": "w3"}],
+        embeddings=[[0.2, 0.2, 0.2], [0.3, 0.3, 0.3]],
+    )
+    result = drawer_collection.query(
+        query_texts=["machine"],
+        where={"wing": "w3"},
+        where_document={"$search": "machine"},
+        n_results=5,
+    )
+    # Only w3's "machine model" document should come back.
+    assert result.ids[0] == ["m1"]
+
+
+def test_query_text_path_uses_default_embedder(drawer_collection):
+    """query_texts without $search triggers the text-embed vector path.
+
+    We can't easily assert ranking without loading the real embedder (slow),
+    so this test only checks that the call completes and returns the typed
+    QueryResult shape. The embedder model is shared with Chroma by design —
+    parity is verified at the integration layer, not here.
+    """
+    # Seed with 384-dim embeddings (matching DefaultEmbeddingFunction output)
+    # so the lazily-created HNSW index has the right dim.
+    import random
+
+    random.seed(0)
+    dim = 384
+    n = 4
+    drawer_collection.add(
+        documents=[
+            "the cat sat on the mat",
+            "dogs chase the ball in the park",
+            "a recipe for chocolate cake",
+            "the fox and the hound are friends",
+        ],
+        ids=[f"t{i}" for i in range(n)],
+        embeddings=[[random.random() for _ in range(dim)] for _ in range(n)],
+    )
+    result = drawer_collection.query(query_texts=["cat"], n_results=2)
+    assert isinstance(result, QueryResult)
+    assert len(result.ids) == 1
+    assert len(result.ids[0]) == 2
+
+
+def test_query_embeddings_empty_list_raises(drawer_collection):
+    with pytest.raises(ValueError):
+        drawer_collection.query(query_embeddings=[])
 
 
 # ---------------------------------------------------------------------------
