@@ -946,3 +946,177 @@ def test_bm25_multi_query_length_mismatch_raises(drawer_collection):
             where_document={"$search": ["foo"]},  # len 1 vs 2
             n_results=3,
         )
+
+
+# ---------------------------------------------------------------------------
+# mp-zt5: embedding_dim caching on SurrealCollection
+# ---------------------------------------------------------------------------
+
+
+def test_embedding_dim_cached_after_first_read(drawer_collection):
+    """mp-zt5: second query() must not issue a second SELECT embedding_dim.
+
+    Every query path calls ``_expected_embedding_dim()`` to enforce the
+    dim contract. Without caching, each query issues a dedicated
+    ``SELECT embedding_dim FROM palace_meta:main`` round-trip before the
+    KNN — wasted work on the hot path. The cache should be populated on
+    the first read (or on the first write that locks the dim) so
+    subsequent reads skip the round-trip.
+    """
+    # Lock the dim via a first write; this should populate the cache
+    # too (the _ensure_hnsw_index code path writes through).
+    drawer_collection.add(
+        documents=["hello"],
+        ids=["id1"],
+        embeddings=[[0.1, 0.2, 0.3]],
+    )
+
+    # Count SELECT embedding_dim statements issued through the shared
+    # connection. Wrap the real query callable so we can observe without
+    # breaking behaviour.
+    real_query = drawer_collection._db.query
+    dim_selects: list[str] = []
+
+    def counting_query(stmt, *args, **kwargs):
+        if isinstance(stmt, str) and (
+            "SELECT embedding_dim FROM palace_meta:main" in stmt
+            or "SELECT embedding_dim FROM palace_meta" in stmt
+        ):
+            dim_selects.append(stmt)
+        return real_query(stmt, *args, **kwargs)
+
+    drawer_collection._db.query = counting_query
+    try:
+        # Two queries back-to-back.
+        drawer_collection.query(
+            query_embeddings=[[0.1, 0.2, 0.3]],
+            n_results=1,
+        )
+        drawer_collection.query(
+            query_embeddings=[[0.1, 0.2, 0.3]],
+            n_results=1,
+        )
+    finally:
+        drawer_collection._db.query = real_query
+
+    # Zero SELECTs for embedding_dim — the write already populated the
+    # cache and both queries short-circuit through it.
+    assert dim_selects == [], (
+        f"expected 0 embedding_dim SELECTs after cache is populated, got {len(dim_selects)}: "
+        f"{dim_selects!r}"
+    )
+
+
+def test_embedding_dim_cache_does_not_cache_none(drawer_collection):
+    """mp-zt5: a None (unlocked) read MUST NOT be cached.
+
+    A fresh palace has ``embedding_dim`` as NONE until the first
+    embedding write lands. If we cached that None, a concurrent (or
+    later) writer locking the dim would be invisible to this process
+    forever. Only locked integer values are cacheable.
+    """
+    # Fresh collection — dim is NONE.
+    assert drawer_collection._expected_embedding_dim() is None
+    # Cache must still be empty; next call re-reads.
+    assert drawer_collection._cached_embedding_dim is None
+
+    # Lock the dim via first write.
+    drawer_collection.add(
+        documents=["seed"],
+        ids=["seed"],
+        embeddings=[[0.1, 0.2, 0.3]],
+    )
+    # Now the cache should be populated (either by the write path or the
+    # next read).
+    dim = drawer_collection._expected_embedding_dim()
+    assert dim == 3
+    assert drawer_collection._cached_embedding_dim == 3
+
+
+def test_cached_dim_still_rejects_wrong_dim_write(drawer_collection):
+    """mp-zt5: caching must not weaken the DimensionMismatchError guard.
+
+    After the cache is populated with X, adding a vector of dim Y != X
+    still raises DimensionMismatchError — the cache is a read-through
+    for the same stored value, not a bypass.
+    """
+    drawer_collection.add(
+        documents=["first"],
+        ids=["id1"],
+        embeddings=[[0.1, 0.2, 0.3]],
+    )
+    # Cache is populated with 3.
+    assert drawer_collection._cached_embedding_dim == 3
+
+    with pytest.raises(DimensionMismatchError):
+        drawer_collection.add(
+            documents=["bad"],
+            ids=["id2"],
+            embeddings=[[0.1, 0.2]],  # dim 2 != cached 3
+        )
+
+
+def test_close_palace_and_reopen_resets_dim_cache(surreal_backend, palace_ref):
+    """mp-zt5: a re-opened collection reads the dim fresh (no stale cache).
+
+    ``close_palace`` evicts the connection and the collection it owned;
+    calling ``get_collection`` again returns a fresh ``SurrealCollection``
+    instance with an empty cache. A subsequent read re-issues the
+    SELECT (exactly once) and populates the new cache.
+    """
+    col = surreal_backend.get_collection(
+        palace=palace_ref, collection_name="mempalace_drawers", create=True
+    )
+    col.add(documents=["x"], ids=["x"], embeddings=[[0.1, 0.2, 0.3]])
+    assert col._cached_embedding_dim == 3
+
+    # Close the palace — cache on the old collection is orphaned with
+    # the closed connection.
+    surreal_backend.close_palace(palace_ref)
+
+    # Re-open: fresh collection instance with empty cache.
+    col2 = surreal_backend.get_collection(
+        palace=palace_ref, collection_name="mempalace_drawers", create=True
+    )
+    assert col2 is not col
+    assert col2._cached_embedding_dim is None
+
+    # A single read populates the cache; a second read uses it (no
+    # further SELECT round-trip).
+    real_query = col2._db.query
+    dim_selects: list[str] = []
+
+    def counting_query(stmt, *args, **kwargs):
+        if isinstance(stmt, str) and "SELECT embedding_dim FROM palace_meta" in stmt:
+            dim_selects.append(stmt)
+        return real_query(stmt, *args, **kwargs)
+
+    col2._db.query = counting_query
+    try:
+        assert col2._expected_embedding_dim() == 3
+        assert col2._expected_embedding_dim() == 3
+    finally:
+        col2._db.query = real_query
+
+    # Exactly one SELECT: the first read. Subsequent read served by the
+    # cache.
+    assert len(dim_selects) == 1, (
+        f"expected exactly 1 SELECT embedding_dim after reopen, got {len(dim_selects)}"
+    )
+
+
+def test_invalidate_embedding_dim_cache_forces_reread(drawer_collection):
+    """mp-zt5: explicit cache invalidation forces a fresh DB read."""
+    drawer_collection.add(
+        documents=["seed"],
+        ids=["seed"],
+        embeddings=[[0.1, 0.2, 0.3]],
+    )
+    assert drawer_collection._cached_embedding_dim == 3
+
+    drawer_collection._invalidate_embedding_dim_cache()
+    assert drawer_collection._cached_embedding_dim is None
+
+    # Next read re-populates.
+    assert drawer_collection._expected_embedding_dim() == 3
+    assert drawer_collection._cached_embedding_dim == 3

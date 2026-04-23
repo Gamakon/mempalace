@@ -553,6 +553,16 @@ class SurrealCollection(BaseCollection):
         # fixed dim at DEFINE time, so we can only build the index once we
         # have an actual embedding in hand.
         self._hnsw_checked = False
+        # mp-zt5: cache ``palace_meta:main.embedding_dim`` after first
+        # successful read. Every ``query()`` previously issued a
+        # ``SELECT embedding_dim FROM palace_meta:main`` round-trip before
+        # the KNN — wasted work on the hot path. The value is immutable
+        # once locked (the race guard in ``_ensure_hnsw_index`` enforces
+        # this across processes), so caching is safe. A ``None`` result
+        # means "dim not yet locked" and MUST NOT be cached, so the next
+        # call re-reads and picks up a concurrent writer's lock.
+        self._cached_embedding_dim: Optional[int] = None
+        self._embedding_dim_lock = Lock()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -628,6 +638,13 @@ class SurrealCollection(BaseCollection):
                 raise DimensionMismatchError(
                     f"palace embedding_dim is {stored_dim} but write uses dim {observed}"
                 )
+
+            # mp-zt5: publish the now-locked dim into the cache so later
+            # ``_expected_embedding_dim`` calls (and every ``query()``
+            # downstream) skip the round-trip.
+            if stored_dim is not None:
+                with self._embedding_dim_lock:
+                    self._cached_embedding_dim = stored_dim
 
             # Define the HNSW index itself. IF NOT EXISTS makes this
             # idempotent across concurrent first-writers; the dim baked in
@@ -1046,7 +1063,20 @@ class SurrealCollection(BaseCollection):
         Returns ``None`` on any failure — the HNSW index itself will reject
         wrong-dim vectors (returning zero hits) so missing meta is a soft
         failure, not a hard one.
+
+        mp-zt5: the result is cached on the instance after the first
+        successful read of a locked (non-None) dim. Every ``query()`` call
+        previously issued a ``SELECT embedding_dim`` round-trip before the
+        KNN; caching eliminates that on the hot path. The cached value is
+        immutable because the race guard in :meth:`_ensure_hnsw_index`
+        rejects conflicting writes with :class:`DimensionMismatchError`.
+        A ``None`` (unlocked) read is deliberately NOT cached so a later
+        first-write is picked up on the next call.
         """
+        # Fast path: cached value (immutable once locked).
+        cached = self._cached_embedding_dim
+        if cached is not None:
+            return cached
         try:
             rows = self._db.query("SELECT embedding_dim FROM palace_meta:main;")
         except Exception:  # pragma: no cover - defensive
@@ -1055,8 +1085,24 @@ class SurrealCollection(BaseCollection):
             return None
         row = rows[0] if isinstance(rows, list) else rows
         if isinstance(row, dict) and isinstance(row.get("embedding_dim"), int):
-            return row["embedding_dim"]
+            dim = row["embedding_dim"]
+            # Atomic publication under the lock. Last-writer-wins is safe
+            # because the DB-side guard ensures all concurrent readers
+            # observe the same locked value.
+            with self._embedding_dim_lock:
+                self._cached_embedding_dim = dim
+            return dim
         return None
+
+    def _invalidate_embedding_dim_cache(self) -> None:
+        """Clear the cached ``embedding_dim`` (mp-zt5).
+
+        Used by :meth:`SurrealBackend.close_palace` / :meth:`close` so a
+        re-opened collection re-reads the (potentially re-created) meta
+        row rather than trusting a stale process-local cache.
+        """
+        with self._embedding_dim_lock:
+            self._cached_embedding_dim = None
 
     def _build_filter_clause(
         self,
