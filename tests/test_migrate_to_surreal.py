@@ -452,3 +452,161 @@ def test_target_db_fresh_proceeds_silently(chroma_palace, surreal_target):
     )
     assert result["migrated"] == 23
     assert result["verified"] is True
+
+
+# ---------------------------------------------------------------------------
+# mp-8me: Numpy float32 embeddings along the migration path.
+#
+# ChromaDB stores embeddings internally as float32. When ``get(include=
+# ['embeddings'])`` returns them, the type is ``numpy.ndarray`` whose
+# elements are numpy scalars (float32 on older chromadb, float64 on
+# 1.5.8). The migration wraps each row with ``list(e)``, which preserves
+# the numpy scalar type. The SurrealDB Python SDK 1.0.8's CBOR encoder
+# has NO path for ``numpy.float32`` (it raises ``BufferError``), so the
+# migration would crash silently on any palace whose chroma binding
+# returns float32. We guard by coercing inside the backend; these tests
+# prove the guard holds end-to-end along the migration code path.
+# ---------------------------------------------------------------------------
+
+
+def test_migration_preserves_numpy_float32_embedding_values(chroma_palace, surreal_target):
+    """A Chroma palace whose embeddings come back as ``numpy.float32`` must
+    migrate cleanly with exact (within float32 tolerance) value preservation.
+
+    We spy on the raw Chroma collection's ``get`` so each row's embedding
+    is re-materialized as a real ``np.float32`` ndarray before the
+    migration sees it — exactly what older chromadb builds do natively.
+    Without the ``_coerce_embedding_to_py_floats`` guard in the Surreal
+    backend this raises::
+
+        BufferError: ('no encoder for type ', <class 'numpy.float32'>)
+
+    With the guard in place, the migration completes and spot-checked
+    drawers round-trip their vectors within float32 tolerance.
+    """
+    import numpy as np
+
+    from mempalace.backends.base import PalaceRef
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.backends.surreal import SurrealBackend
+
+    original_get = ChromaCollection.get
+
+    def float32_get(self, **kwargs):
+        res = original_get(self, **kwargs)
+        # Rebuild each embedding as a real numpy.float32 ndarray — the
+        # migration wraps with ``list(e)``, yielding a list of np.float32
+        # scalars, which is the payload shape that broke the SDK.
+        if res.embeddings is None:
+            return res
+        new_embs = [np.asarray(e, dtype=np.float32) for e in res.embeddings]
+        from dataclasses import replace
+
+        return replace(res, embeddings=new_embs)
+
+    # Grab the original float values before the migration so we can verify
+    # round-trip fidelity within float32 tolerance.
+    want_first = chroma_palace["drawer_embeds"][0]
+    first_id = chroma_palace["drawer_ids"][0]
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ChromaCollection, "get", float32_get)
+        result = migrate_to_surreal(
+            source_palace=chroma_palace["path"],
+            target_ns=surreal_target,
+            progress=False,
+        )
+    assert result["migrated"] == 23
+    assert result["verified"] is True
+
+    # Spot-check the first drawer's vector survives within float32 tolerance.
+    db_name = _derive_surreal_db_name(chroma_palace["path"])
+    backend = SurrealBackend(namespace=surreal_target)
+    try:
+        col = backend.get_collection(
+            palace=PalaceRef(id=db_name, namespace=db_name),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+        got = col.get(ids=[first_id], include=["embeddings"])
+        assert got.ids == [first_id]
+        assert got.embeddings is not None
+        got_vec = got.embeddings[0]
+        # Output must be plain Python floats (coercion contract).
+        assert all(type(x) is float for x in got_vec)
+        # Values equal within float32 mantissa (~1e-7 relative).
+        assert len(got_vec) == len(want_first)
+        for g, w in zip(got_vec, want_first):
+            assert abs(float(g) - float(w)) <= 1e-5, (
+                f"value drift beyond float32 tolerance: {g!r} vs {w!r}"
+            )
+    finally:
+        backend.close()
+
+
+def test_migration_with_numpy_float32_seeded_palace(tmp_path, surreal_target):
+    """Seed a Chroma palace by writing ``np.float32`` ndarrays directly.
+
+    This exercises the write-through path rather than spying on the
+    read — chroma accepts ``np.asarray(..., dtype=np.float32)`` as an
+    embedding and stores it natively. The migration must succeed and
+    the final Surreal rows must be plain Python floats (not numpy
+    scalars) within float32 tolerance of the seed values.
+    """
+    import numpy as np
+
+    from mempalace.backends.base import PalaceRef
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.backends.surreal import SurrealBackend
+
+    palace_path = tmp_path / "src_palace_f32"
+    palace_path.mkdir()
+    backend = ChromaBackend()
+    drawer_col = backend.get_or_create_collection(str(palace_path), "mempalace_drawers")
+
+    ids = [f"f32_{i:02d}" for i in range(6)]
+    docs = [f"doc {i}" for i in range(6)]
+    metas = [{"wing": "w", "room": "r", "chunk_index": i} for i in range(6)]
+    # Real NumPy float32 ndarrays — the type Chroma stores internally.
+    seed_vecs = [
+        np.asarray([0.1 * i, 0.2 * i, 0.3 * i, 0.4 * i], dtype=np.float32) for i in range(6)
+    ]
+    drawer_col.add(
+        ids=ids,
+        documents=docs,
+        metadatas=metas,
+        embeddings=seed_vecs,
+    )
+    backend.close()
+
+    result = migrate_to_surreal(
+        source_palace=str(palace_path),
+        target_ns=surreal_target,
+        progress=False,
+    )
+    assert result["migrated"] == 6
+    assert result["verified"] is True
+
+    # Verify from Surreal that every vector landed and values match.
+    db_name = _derive_surreal_db_name(str(palace_path))
+    surreal_b = SurrealBackend(namespace=surreal_target)
+    try:
+        col = surreal_b.get_collection(
+            palace=PalaceRef(id=db_name, namespace=db_name),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+        got = col.get(ids=ids, include=["embeddings"])
+        assert sorted(got.ids) == sorted(ids)
+        got_by_id = dict(zip(got.ids, got.embeddings))
+        for i, gid in enumerate(ids):
+            gvec = got_by_id[gid]
+            assert all(type(x) is float for x in gvec), (
+                f"numpy scalar leaked through on {gid}: {[type(x).__name__ for x in gvec]}"
+            )
+            for g, w in zip(gvec, seed_vecs[i].tolist()):
+                assert abs(g - w) <= 1e-5, f"drift on {gid}: {g!r} vs {w!r}"
+    finally:
+        surreal_b.close()

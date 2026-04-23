@@ -1203,3 +1203,373 @@ def test_invalidate_embedding_dim_cache_forces_reread(drawer_collection):
     # Next read re-populates.
     assert drawer_collection._expected_embedding_dim() == 3
     assert drawer_collection._cached_embedding_dim == 3
+
+
+# ---------------------------------------------------------------------------
+# mp-8me: NumPy scalar embeddings must serialize cleanly through the
+# SurrealDB Python SDK (1.0.8's CBOR encoder has no path for numpy.float32,
+# so writes blow up unless the backend coerces scalars to plain Python
+# floats before handing them to the SDK). These smoke tests prove each
+# input shape the migration or a caller may realistically produce actually
+# round-trips and return matching values within the input dtype's tolerance.
+# ---------------------------------------------------------------------------
+
+
+def _embeddings_close(got, want, *, tol: float) -> None:
+    """Per-element assertion that also surfaces which index failed."""
+    assert len(got) == len(want), f"len mismatch: got {len(got)} want {len(want)}"
+    for i, (g, w) in enumerate(zip(got, want)):
+        assert abs(float(g) - float(w)) <= tol, f"element {i}: got {g!r} want {w!r} (tol {tol})"
+        # Output MUST be a plain Python float — the coercion layer is the
+        # contract the SDK relies on, so if a NumPy scalar leaked through we
+        # want the test to fail loudly here rather than silently on a later
+        # write that would hit the ``BufferError``.
+        assert type(g) is float, f"element {i} is {type(g).__name__}, expected float"
+
+
+def test_numpy_float32_list_of_scalars_roundtrip(drawer_collection):
+    """Case A (mp-8me): a list of ``np.float32`` scalars must survive add+get.
+
+    This is the shape a caller produces with ``[np.float32(x) for x in ...]``
+    or equivalently ``list(np.asarray(..., dtype=np.float32))``. Without the
+    ``_coerce_embedding_to_py_floats`` coercion this raised::
+
+        BufferError: ('no encoder for type ', <class 'numpy.float32'>)
+    """
+    import numpy as np
+
+    want_f64 = [0.1, 0.2, 0.3]
+    vec = [np.float32(x) for x in want_f64]
+    drawer_collection.add(
+        documents=["f32-scalars"],
+        ids=["f32-scalars"],
+        metadatas=[{"dtype": "float32"}],
+        embeddings=[vec],
+    )
+    r = drawer_collection.get(ids=["f32-scalars"], include=["embeddings"])
+    assert r.ids == ["f32-scalars"]
+    assert r.embeddings is not None and len(r.embeddings) == 1
+    # float32 mantissa is 23 bits → ~1e-7 relative; 1e-5 absolute is safely inside.
+    _embeddings_close(r.embeddings[0], want_f64, tol=1e-5)
+
+
+def test_numpy_float32_list_of_nparray_roundtrip(drawer_collection):
+    """Case B (mp-8me): ``list(np.asarray(..., dtype=float32))`` — the exact
+    shape :func:`mempalace.migrate._iter_chroma_batches` emits at line ~353::
+
+        embed_list = [list(e) if e is not None else None for e in embeds]
+
+    where each ``e`` is a NumPy float32 row from ChromaDB. This test
+    mirrors that transformation precisely so a regression in the backend
+    breaks migration before it hits a user.
+    """
+    import numpy as np
+
+    want_f64 = [0.4, 0.5, 0.6]
+    arr = np.asarray(want_f64, dtype=np.float32)
+    vec = list(arr)  # elementwise: each is np.float32
+    # Sanity: we are actually exercising the NumPy path, not a plain float list.
+    assert all(isinstance(x, np.float32) for x in vec)
+
+    drawer_collection.add(
+        documents=["f32-from-ndarray"],
+        ids=["f32-from-ndarray"],
+        metadatas=[{"dtype": "float32"}],
+        embeddings=[vec],
+    )
+    r = drawer_collection.get(ids=["f32-from-ndarray"], include=["embeddings"])
+    assert r.ids == ["f32-from-ndarray"]
+    _embeddings_close(r.embeddings[0], want_f64, tol=1e-5)
+
+
+def test_numpy_float64_roundtrip(drawer_collection):
+    """Case C (mp-8me): ``np.float64`` scalars round-trip bit-exact.
+
+    ``np.float64`` is a ``float`` subclass so it already serialized in the
+    SDK before the coercion was added — but once the coercion is in place
+    callers still get plain ``float`` back and exact equality holds.
+    """
+    import numpy as np
+
+    want = [0.7, 0.8, 0.9]
+    vec = list(np.asarray(want, dtype=np.float64))
+    assert all(isinstance(x, np.float64) for x in vec)
+
+    drawer_collection.add(
+        documents=["f64"],
+        ids=["f64"],
+        metadatas=[{"dtype": "float64"}],
+        embeddings=[vec],
+    )
+    r = drawer_collection.get(ids=["f64"], include=["embeddings"])
+    # Float64 preserves the exact decimal representation.
+    _embeddings_close(r.embeddings[0], want, tol=0.0)
+
+
+def test_plain_python_floats_roundtrip(drawer_collection):
+    """Case D (mp-8me): baseline — a plain list of Python floats.
+
+    If this ever regresses the coercion helper is broken, not the SDK.
+    """
+    want = [0.11, 0.22, 0.33]
+    drawer_collection.add(
+        documents=["py-floats"],
+        ids=["py-floats"],
+        metadatas=[{"dtype": "python"}],
+        embeddings=[want],
+    )
+    r = drawer_collection.get(ids=["py-floats"], include=["embeddings"])
+    _embeddings_close(r.embeddings[0], want, tol=0.0)
+
+
+def test_numpy_float32_upsert_and_update_roundtrip(drawer_collection):
+    """mp-8me: the ``upsert`` and ``update`` paths must coerce too.
+
+    ``add`` and ``upsert`` share ``_record_payload``, but ``update`` goes
+    through ``_update_one`` which builds its own MERGE payload. The fix has
+    to cover both, so exercise them explicitly with a NumPy vector.
+    """
+    import numpy as np
+
+    # Initial write via upsert (NumPy float32 list of ndarray).
+    v1 = list(np.asarray([0.01, 0.02, 0.03], dtype=np.float32))
+    drawer_collection.upsert(
+        documents=["upsert-np"],
+        ids=["upsert-np"],
+        embeddings=[v1],
+    )
+    r1 = drawer_collection.get(ids=["upsert-np"], include=["embeddings"])
+    _embeddings_close(r1.embeddings[0], [0.01, 0.02, 0.03], tol=1e-5)
+
+    # Replace vector via update — different NumPy scalars.
+    v2 = [np.float32(0.9), np.float32(0.8), np.float32(0.7)]
+    drawer_collection.update(
+        ids=["upsert-np"],
+        embeddings=[v2],
+    )
+    r2 = drawer_collection.get(ids=["upsert-np"], include=["embeddings"])
+    _embeddings_close(r2.embeddings[0], [0.9, 0.8, 0.7], tol=1e-5)
+
+
+def test_numpy_float32_query_embeddings_path(drawer_collection):
+    """mp-8me: ``query(query_embeddings=...)`` must also coerce NumPy scalars.
+
+    The HNSW KNN binding path builds its own vector payload and would hit
+    the same ``BufferError`` if a caller passed NumPy scalars in as a query
+    vector — exactly what a live recall path does when the embedder returns
+    float32 ndarrays.
+    """
+    import numpy as np
+
+    drawer_collection.add(
+        documents=["d1", "d2"],
+        ids=["d1", "d2"],
+        embeddings=[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+    )
+
+    q = list(np.asarray([0.0, 1.0, 0.0], dtype=np.float32))
+    res = drawer_collection.query(query_embeddings=[q], n_results=2)
+    # A pure smoke: the NumPy query vector did not blow up and returned rows.
+    assert res.ids and len(res.ids[0]) >= 1
+    assert "d1" in res.ids[0]
+
+
+def test_coerce_embedding_helper_direct():
+    """Unit check on the coercion helper itself (mp-8me).
+
+    Keeps the contract explicit: NumPy scalars become plain Python floats,
+    the output type is always ``float``, and a pre-coerced list passes
+    through unchanged (identity) on the fast path so we don't pay an
+    allocation per write for the common case.
+    """
+    import numpy as np
+
+    from mempalace.backends.surreal import _coerce_embedding_to_py_floats
+
+    # NumPy float32 scalars -> plain floats.
+    out = _coerce_embedding_to_py_floats([np.float32(1.5), np.float32(2.5)])
+    assert out == [1.5, 2.5]
+    assert all(type(x) is float for x in out)
+
+    # NumPy array input (not a list) is tolerated — we iterate it.
+    out2 = _coerce_embedding_to_py_floats(np.asarray([3.25, 4.25], dtype=np.float32))
+    assert out2 == [3.25, 4.25]
+    assert all(type(x) is float for x in out2)
+
+    # Plain Python list fast path: returned as-is (identity).
+    plain = [0.1, 0.2, 0.3]
+    assert _coerce_embedding_to_py_floats(plain) is plain
+
+    # float64 inputs normalize too (they are a ``float`` subclass but we
+    # still want a uniform output type).
+    out3 = _coerce_embedding_to_py_floats([np.float64(9.0)])
+    assert out3 == [9.0]
+    assert type(out3[0]) is float
+
+
+# ---------------------------------------------------------------------------
+# mp-mta: INFO-query shape hardening against SurrealDB 3.0.4's error-string wart
+# ---------------------------------------------------------------------------
+
+
+def test_safe_info_query_coerces_error_string_and_warns(caplog):
+    """mp-mta: ``_safe_info_query`` returns ``{}`` when Surreal returns a
+    string, and logs a WARN so version-drift is observable.
+
+    Simulates the 3.0.4 wart where ``INFO FOR DB`` under concurrent DDL
+    load returns an error STRING as the query result rather than raising.
+    The helper must never propagate a shape mismatch as an exception.
+    """
+    import logging
+
+    from mempalace.backends.surreal import _safe_info_query
+
+    class _FakeConn:
+        def query(self, stmt):  # noqa: ARG002
+            return "There was a problem with the database: something transient"
+
+    with caplog.at_level(logging.WARNING, logger="mempalace.backends.surreal"):
+        result = _safe_info_query(_FakeConn(), "INFO FOR DB", op_name="unit_test")
+
+    assert result == {}
+    # WARN captured with the offending string so drift is visible.
+    warn_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warn_records, "expected a WARN log when INFO returns a string"
+    msg = warn_records[-1].getMessage()
+    assert "mp-mta" in msg
+    assert "exc_str" in msg
+    assert "something transient" in msg
+    assert "unit_test" in msg
+
+
+def test_safe_info_query_returns_dict_untouched():
+    """mp-mta: happy path — dict in, dict out, no warnings."""
+    from mempalace.backends.surreal import _safe_info_query
+
+    expected = {"tables": {"drawer": "DEFINE TABLE drawer ..."}}
+
+    class _FakeConn:
+        def query(self, stmt):  # noqa: ARG002
+            return expected
+
+    assert _safe_info_query(_FakeConn(), "INFO FOR DB", op_name="unit_test") is expected
+
+
+def test_safe_info_query_unwraps_single_element_list():
+    """mp-mta: Surreal sometimes wraps the payload in a single-element list."""
+    from mempalace.backends.surreal import _safe_info_query
+
+    inner = {"tables": {"drawer": "..."}}
+
+    class _FakeConn:
+        def query(self, stmt):  # noqa: ARG002
+            return [inner]
+
+    assert _safe_info_query(_FakeConn(), "INFO FOR DB", op_name="unit_test") == inner
+
+
+def test_safe_info_query_none_and_unexpected_shapes_warn(caplog):
+    """mp-mta: ``None`` / ints / empty lists all coerce to ``{}`` + WARN."""
+    import logging
+
+    from mempalace.backends.surreal import _safe_info_query
+
+    class _FakeConn:
+        def __init__(self, value):
+            self._value = value
+
+        def query(self, stmt):  # noqa: ARG002
+            return self._value
+
+    with caplog.at_level(logging.WARNING, logger="mempalace.backends.surreal"):
+        assert _safe_info_query(_FakeConn(None), "INFO FOR DB", op_name="t") == {}
+        assert _safe_info_query(_FakeConn([]), "INFO FOR DB", op_name="t") == {}
+        assert _safe_info_query(_FakeConn(42), "INFO FOR DB", op_name="t") == {}
+
+    # All three should have logged a WARN each.
+    warn_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warn_records) >= 3
+    for rec in warn_records:
+        assert "mp-mta" in rec.getMessage()
+
+
+def test_safe_info_query_propagates_real_exceptions():
+    """mp-mta: transport / auth / real errors still raise — we only
+    swallow *shape* mismatches, not genuine failures.
+    """
+    from mempalace.backends.surreal import _safe_info_query
+
+    class _AuthError(RuntimeError):
+        pass
+
+    class _FakeConn:
+        def query(self, stmt):  # noqa: ARG002
+            raise _AuthError("not authenticated")
+
+    # Bypass retry backoff sleeps: pass a no-op helper so the test is fast.
+    def _no_retry(fn, *, op_name):  # noqa: ARG001
+        return fn
+
+    with pytest.raises(_AuthError):
+        _safe_info_query(_FakeConn(), "INFO FOR DB", op_name="unit_test", retry_helper=_no_retry)
+
+
+def test_get_collection_tolerates_info_error_string(
+    surreal_backend, palace_ref, monkeypatch, caplog
+):
+    """mp-mta: end-to-end — if ``INFO FOR DB`` returns a string during
+    ``get_collection()``, we must not raise; we must treat it as
+    "not bootstrapped" and drive the create-path normally.
+
+    This is the wart that mp-33y first tripped over: a previous ad-hoc
+    coercion lived in ``get_collection``. The hardened helper now covers
+    every INFO site uniformly, and this test locks the behaviour in.
+    """
+    import logging
+
+    from mempalace.backends.surreal import PalaceNotFoundError
+
+    # Bootstrap a real palace so the db_name resolves normally.
+    col = surreal_backend.get_collection(
+        palace=palace_ref, collection_name="mempalace_drawers", create=True
+    )
+    assert col._table == "drawer"
+
+    # Now force the next ``INFO FOR DB`` to return an error STRING.
+    conn = surreal_backend._connect(
+        # Re-derive the sanitised db name via the same helper
+        # ``get_collection`` uses.
+        __import__("mempalace.backends.surreal", fromlist=["_safe_db_name"])._safe_db_name(
+            palace_ref
+        )
+    )
+    real_query = conn.query
+    call_state = {"fired": False}
+
+    def fake_query(stmt, *args, **kwargs):
+        if stmt.strip().upper().startswith("INFO FOR DB") and not call_state["fired"]:
+            call_state["fired"] = True
+            return "There was a problem with the database: simulated 3.0.4 wart"
+        return real_query(stmt, *args, **kwargs)
+
+    monkeypatch.setattr(conn, "query", fake_query)
+
+    # With ``create=False``, an empty-dict INFO means "no tables visible"
+    # and ``PalaceNotFoundError`` should be raised — proving (a) the
+    # string was coerced, not propagated, and (b) the caller handled the
+    # coerced value gracefully.
+    with caplog.at_level(logging.WARNING, logger="mempalace.backends.surreal"):
+        with pytest.raises(PalaceNotFoundError):
+            surreal_backend.get_collection(
+                palace=palace_ref,
+                collection_name="mempalace_drawers",
+                create=False,
+            )
+
+    # WARN was fired with the offending string.
+    warn_records = [
+        r for r in caplog.records if r.levelno == logging.WARNING and "mp-mta" in r.getMessage()
+    ]
+    assert warn_records, "expected a mp-mta WARN when INFO FOR DB returns a string"
+    assert "simulated 3.0.4 wart" in warn_records[-1].getMessage()
+    assert call_state["fired"], "fake INFO patch never ran — test is not exercising the wart"

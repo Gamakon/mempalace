@@ -526,6 +526,35 @@ def _bootstrap_ddl(embedding_dim: Optional[int] = None) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _coerce_embedding_to_py_floats(vec: Any) -> list[float]:
+    """Coerce a vector's elements to plain Python ``float``.
+
+    Rationale (mp-8me): ChromaDB stores embeddings as ``numpy.float32``
+    arrays and hands them back through ``get(..., include=['embeddings'])``
+    as ndarrays whose elements are ``numpy.float32`` scalars. The migration
+    pipeline wraps each row as ``list(e)`` (see :mod:`mempalace.migrate`),
+    which produces a *Python list* of ``numpy.float32`` scalars — and the
+    SurrealDB Python SDK 1.0.8's CBOR encoder has no path for NumPy scalar
+    types, so the write blows up with::
+
+        BufferError: ('no encoder for type ', <class 'numpy.float32'>)
+
+    ``numpy.float64`` happens to survive because it is a ``float`` subclass,
+    but that is an accident of the SDK's current type table and must not be
+    relied on. The coercion here runs once per vector per write and is O(dim),
+    negligible against the HTTP round-trip — but it insulates the backend
+    from SDK version drift and from any future NumPy dtype the caller hands
+    us (float16, bfloat16 once ndarray supports it, etc.).
+    """
+    # Fast path: already a plain list of Python floats. ``type(x) is float``
+    # rejects subclasses (``numpy.float64`` IS a ``float`` subclass) so mixed
+    # NumPy lists still flow through the coercion branch and are normalized
+    # to a uniform output type.
+    if isinstance(vec, list) and all(type(x) is float for x in vec):
+        return vec
+    return [float(x) for x in vec]
+
+
 def _validate_writes(
     *,
     documents: list[str],
@@ -698,7 +727,10 @@ class SurrealCollection(BaseCollection):
             "metadata": dict(metadata) if metadata else {},
         }
         if embedding is not None:
-            payload["embedding"] = list(embedding)
+            # Coerce any NumPy scalar types to plain Python ``float`` — the
+            # SurrealDB SDK 1.0.8 CBOR encoder has no ``numpy.float32`` path
+            # (see :func:`_coerce_embedding_to_py_floats`). mp-8me.
+            payload["embedding"] = _coerce_embedding_to_py_floats(embedding)
         return payload
 
     # ------------------------------------------------------------------
@@ -849,7 +881,14 @@ class SurrealCollection(BaseCollection):
         for i, ext_id in enumerate(ids):
             meta_patch = dict(metadatas[i] or {}) if metadatas is not None else None
             doc = documents[i] if documents is not None else None
-            emb = list(embeddings[i]) if embeddings is not None else None
+            # mp-8me: coerce NumPy scalar floats to plain Python floats here
+            # — the MERGE path binds the vector directly to the SDK without
+            # going through ``_record_payload``.
+            emb = (
+                _coerce_embedding_to_py_floats(embeddings[i])
+                if embeddings is not None
+                else None
+            )
             self._update_one(ext_id, doc, meta_patch, emb)
 
     def _update_one(
@@ -1025,7 +1064,11 @@ class SurrealCollection(BaseCollection):
 
         # Vector path (default): HNSW KNN over embeddings.
         if query_embeddings is not None:
-            vectors = [list(v) for v in query_embeddings]
+            # mp-8me: coerce NumPy scalar floats to plain Python floats before
+            # the SDK sees them — callers routinely pass ``np.asarray(...)``
+            # or ``list(np.asarray(...))`` results, and the SurrealDB 1.0.8
+            # CBOR encoder has no ``numpy.float32`` path.
+            vectors = [_coerce_embedding_to_py_floats(v) for v in query_embeddings]
         else:
             vectors = _embed_texts(list(query_texts))
 
@@ -1171,7 +1214,9 @@ class SurrealCollection(BaseCollection):
         filter_clause, bindings = self._build_filter_clause(
             where=where, where_document=where_document
         )
-        bindings["vec"] = list(vec)
+        # mp-8me: defensive coercion in case ``_hnsw_knn`` is ever reached
+        # without going through :meth:`query` (which already coerces).
+        bindings["vec"] = _coerce_embedding_to_py_floats(vec)
         n = int(n_results)
 
         q = (
