@@ -111,6 +111,30 @@ echo
 file_count="$(find "$BACKUP" -type f | wc -l | tr -d ' ')"
 echo "Backup file count: $file_count"
 
+# Resolve target to an absolute path for the home-palace guard comparison.
+# realpath isn't portable on macOS without coreutils, so use a small fallback.
+resolve_path() {
+  local p="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$p"
+  else
+    # Best-effort: expand ~ and make absolute
+    case "$p" in
+      "~") echo "$HOME" ;;
+      "~/"*) echo "$HOME/${p#~/}" ;;
+      /*) echo "$p" ;;
+      *) echo "$PWD/$p" ;;
+    esac
+  fi
+}
+
+TARGET_ABS="$(resolve_path "$TARGET")"
+HOME_PALACE_ABS="$(resolve_path "$HOME/.mempalace")"
+IS_HOME_PALACE=0
+if [[ "$TARGET_ABS" == "$HOME_PALACE_ABS" ]]; then
+  IS_HOME_PALACE=1
+fi
+
 if [[ -e "$TARGET" ]]; then
   if [[ -n "$(ls -A "$TARGET" 2>/dev/null || true)" ]]; then
     echo
@@ -128,7 +152,28 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
-if [[ $ASSUME_YES -ne 1 ]]; then
+# Guard rail: if target is the real home palace AND it is non-empty, require
+# the user to TYPE the exact path (not just 'y'). Refuses with --yes because
+# an unattended script should never blindly overwrite the real palace.
+# This is a belt-and-braces defense against the near-miss where a self-test
+# accidentally ran against ~/.mempalace.
+if [[ $IS_HOME_PALACE -eq 1 && -e "$TARGET" && -n "$(ls -A "$TARGET" 2>/dev/null || true)" ]]; then
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    echo >&2
+    echo "REFUSING: --yes cannot be used to overwrite the real home palace ($TARGET_ABS)." >&2
+    echo "Rerun without --yes and type the full path to confirm." >&2
+    exit 3
+  fi
+  echo
+  echo "DANGER: target is your real home palace ($TARGET_ABS) and it is non-empty."
+  echo "To confirm, type the full target path exactly:"
+  echo "  expected: $TARGET_ABS"
+  read -r -p "> " typed_path
+  if [[ "$typed_path" != "$TARGET_ABS" ]]; then
+    echo "Path did not match. Aborted." >&2
+    exit 1
+  fi
+elif [[ $ASSUME_YES -ne 1 ]]; then
   echo
   read -r -p "Proceed with restore? [y/N] " reply
   case "$reply" in
