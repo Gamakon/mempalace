@@ -193,6 +193,37 @@ class TestAddTriple:
         assert rows[0]["valid_to"] == "2024-06-01"
         assert rows[0]["current"] is False
 
+    def test_add_triple_records_extracted_at(self, kg):
+        """mp-2um: every new triple must carry an ``extracted_at`` stamp
+        for provenance parity with the SQLite KG
+        (``knowledge_graph.py:88``).
+
+        The schema doc promised this via a ``DEFAULT time::now()`` field
+        definition, but this module uses SCHEMALESS tables so that DEFAULT
+        never fires. We now set ``extracted_at = time::now()`` explicitly
+        on the RELATE so the stamp lands regardless of whether the schema
+        is tightened later (mp-6gu).
+        """
+        from datetime import datetime, timedelta, timezone
+
+        before = datetime.now(timezone.utc) - timedelta(seconds=5)
+        kg.add_triple("Alice", "knows", "Bob")
+        after = datetime.now(timezone.utc) + timedelta(seconds=5)
+
+        # Read the raw triple row back — ``extracted_at`` is not surfaced
+        # via the high-level query helpers (yet), so we hit the table
+        # directly. The SDK decodes SurrealDB ``datetime`` values as
+        # ``datetime.datetime`` with timezone info.
+        rows = kg._db.query("SELECT extracted_at FROM triple")
+        assert rows, "expected one triple row"
+        stamp = rows[0].get("extracted_at")
+        assert stamp is not None, f"extracted_at not set on triple: {rows[0]!r}"
+        assert isinstance(stamp, datetime), (
+            f"extracted_at should be a datetime, got {type(stamp).__name__}"
+        )
+        # Stamped "now" — must fall inside the observation window.
+        assert before <= stamp <= after, f"extracted_at {stamp} outside window [{before}, {after}]"
+
 
 # ── Queries ────────────────────────────────────────────────────────────
 

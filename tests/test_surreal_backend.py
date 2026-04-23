@@ -178,6 +178,60 @@ def test_add_rejects_duplicate_id(drawer_collection):
         drawer_collection.add(documents=["b"], ids=["dup"])
 
 
+def test_add_duplicate_raises_specific_duplicate_error(drawer_collection):
+    """mp-bac: duplicate-id detection uses the wire-level status/kind
+    envelope, not string-sniffing. We raise a typed ``DuplicateIdError``
+    with the offending id embedded, so callers can catch it specifically
+    instead of a bare ``Exception``.
+    """
+    from mempalace.backends.surreal import DuplicateIdError
+
+    drawer_collection.add(documents=["a"], ids=["dup"])
+    with pytest.raises(DuplicateIdError) as exc:
+        drawer_collection.add(documents=["b"], ids=["dup"])
+    # The raised error carries the duplicate id for observability.
+    assert "'dup'" in str(exc.value) or '"dup"' in str(exc.value)
+    # The original record is untouched — duplicate rejection must not
+    # overwrite the existing document.
+    r = drawer_collection.get(ids=["dup"])
+    assert r.documents == ["a"]
+
+
+def test_add_does_not_string_sniff_error_messages(drawer_collection, monkeypatch):
+    """mp-bac: regression guard — success must not be mis-classified as an
+    error just because the SDK happens to return a string.
+
+    The old implementation raised ``RuntimeError`` on any ``str`` return
+    from ``self._db.create``. The new implementation only flags errors
+    reported via the wire-protocol ``status == "ERR"`` envelope, so a
+    legitimate success path is never misread.
+    """
+    from mempalace.backends.surreal import _raise_on_statement_error
+
+    # Wire-protocol OK envelope with a string payload: the helper must
+    # treat this as success, not error. Pre-fix behaviour would have
+    # rejected any ``str`` return — a latent false-positive.
+    ok_response = {"result": [{"status": "OK", "result": "some-ok-string", "time": "1µs"}]}
+    assert _raise_on_statement_error(ok_response, "probe") == "some-ok-string"
+
+
+def test_add_statement_err_raises_backend_error(drawer_collection):
+    """mp-bac: non-duplicate ERR statuses raise ``BackendError`` — not a
+    ``DuplicateIdError`` and not a silent success.
+    """
+    from mempalace.backends import BackendError
+    from mempalace.backends.surreal import DuplicateIdError, _raise_on_statement_error
+
+    err_response = {
+        "result": [{"status": "ERR", "kind": "Thrown", "result": "some failure", "time": "1µs"}]
+    }
+    with pytest.raises(BackendError) as exc:
+        _raise_on_statement_error(err_response, "probe")
+    # BackendError hierarchy: DuplicateIdError is a subclass, so catch the
+    # parent and confirm the type is NOT DuplicateIdError.
+    assert not isinstance(exc.value, DuplicateIdError)
+
+
 def test_add_length_mismatch_raises(drawer_collection):
     with pytest.raises(ValueError):
         drawer_collection.add(documents=["a", "b"], ids=["x"])

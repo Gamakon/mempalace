@@ -71,6 +71,16 @@ class HnswIndexCreationError(BackendError):
     """
 
 
+class DuplicateIdError(BackendError):
+    """Raised when ``add()`` is called with an id that already exists.
+
+    Matches Chroma's fail-on-duplicate contract. Detection is driven by
+    the SurrealDB wire protocol's per-statement ``status`` / ``kind``
+    fields (see :meth:`SurrealCollection._create_record`), not by
+    string-matching the error message.
+    """
+
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_URL = os.environ.get("MEMPALACE_SURREAL_URL", "http://127.0.0.1:8000")
@@ -128,17 +138,58 @@ def _validate_where(where: Optional[dict]) -> None:
 _DB_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_]+")
 
 
-def _raise_if_sdk_error(result: Any, context: str) -> None:
-    """Translate surrealdb-python's error-as-string returns into exceptions.
+def _raise_on_statement_error(
+    raw_response: Any, context: str, *, duplicate_id: Optional[str] = None
+) -> Any:
+    """Inspect a ``query_raw`` response and raise on per-statement errors.
 
-    The blocking-HTTP connection in ``surrealdb`` 1.0.x returns certain
-    errors — most notably ``create`` on a duplicate id, and schema-validation
-    failures — as plain strings instead of raising. Treat a string response
-    where a dict (single record) or list (set of records) was expected as
-    an error.
+    SurrealDB's RPC protocol wraps every statement in a result envelope
+    of the form::
+
+        {"result": [{"status": "OK"|"ERR", "result": <value>, ...}, ...]}
+
+    The Python SDK (1.0.8) only surfaces top-level transport errors via
+    ``check_response_for_error`` — a per-statement ``status == "ERR"`` is
+    left for the caller to discover, and the high-level ``create()`` /
+    ``upsert()`` helpers pass the error string through as the return
+    value. That made duplicate-id detection fragile: the previous
+    implementation string-sniffed the return of ``create()`` and treated
+    any ``str`` result as an error, which would break silently if the SDK
+    ever returned a legitimate string or changed its error format.
+
+    This helper uses the protocol-level ``status`` + ``kind`` fields
+    instead. It returns the unwrapped ``result`` on success; on error it
+    raises :class:`DuplicateIdError` for ``kind == "AlreadyExists"`` (or
+    unique-index violations that carry the same semantics) and
+    :class:`BackendError` otherwise.
+
+    The ``duplicate_id`` parameter lets callers tag the raised
+    ``DuplicateIdError`` with the caller's id for a clearer message.
     """
-    if isinstance(result, str):
-        raise RuntimeError(f"surreal backend {context}: {result}")
+    if not isinstance(raw_response, dict):
+        raise BackendError(f"surreal backend {context}: unexpected response {raw_response!r}")
+    results = raw_response.get("result")
+    if not isinstance(results, list) or not results:
+        raise BackendError(f"surreal backend {context}: no result in response")
+    stmt = results[0]
+    if not isinstance(stmt, dict):
+        raise BackendError(f"surreal backend {context}: malformed statement result")
+    status = stmt.get("status")
+    if status == "OK":
+        return stmt.get("result")
+    # Any non-OK status is an error. Duplicate / unique-violation kinds
+    # map to DuplicateIdError so callers can catch them specifically.
+    kind = stmt.get("kind") or ""
+    message = stmt.get("result") if isinstance(stmt.get("result"), str) else str(stmt)
+    # ``kind`` is the stable protocol-level signal (AlreadyExists for a
+    # direct record-id collision, IndexExists for a UNIQUE-index hit).
+    if kind in ("AlreadyExists", "IndexExists"):
+        raise DuplicateIdError(
+            f"surreal backend {context}: duplicate id {duplicate_id!r}: {message}"
+            if duplicate_id is not None
+            else f"surreal backend {context}: {message}"
+        )
+    raise BackendError(f"surreal backend {context}: {message}")
 
 
 def _safe_close(conn) -> None:
@@ -513,11 +564,19 @@ class SurrealCollection(BaseCollection):
                 metadata=metadatas[i] if metadatas is not None else None,
                 embedding=embeddings[i] if embeddings is not None else None,
             )
-            # The blocking-HTTP SDK returns error strings from `create` on
-            # duplicate-id instead of raising. Detect + raise so ``add``
-            # matches Chroma's "fail on duplicate" contract.
-            result = self._db.create(self._rid(ext_id), payload)
-            _raise_if_sdk_error(result, f"add id={ext_id!r}")
+            # mp-bac: bypass the SDK's high-level ``create`` helper — it
+            # swallows per-statement errors into its return value (as a
+            # plain string) and the previous "treat-any-string-as-error"
+            # sniff broke silently whenever the SDK surface changed. Drive
+            # ``CREATE ... CONTENT $c`` through ``query_raw`` instead and
+            # inspect the wire-level ``status`` / ``kind`` fields, which
+            # are the protocol's stable error signal.
+            rid = self._rid(ext_id)
+            raw = self._db.query_raw(
+                "CREATE $rec CONTENT $c",
+                {"rec": rid, "c": payload},
+            )
+            _raise_on_statement_error(raw, f"add id={ext_id!r}", duplicate_id=ext_id)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_writes(documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings)
@@ -531,8 +590,15 @@ class SurrealCollection(BaseCollection):
                 metadata=metadatas[i] if metadatas is not None else None,
                 embedding=embeddings[i] if embeddings is not None else None,
             )
-            result = self._db.upsert(self._rid(ext_id), payload)
-            _raise_if_sdk_error(result, f"upsert id={ext_id!r}")
+            # mp-bac: same protocol-level check as ``add`` — upsert can
+            # still fail with schema-validation errors that the SDK
+            # would otherwise surface as a return-value string.
+            rid = self._rid(ext_id)
+            raw = self._db.query_raw(
+                "UPSERT $rec CONTENT $c",
+                {"rec": rid, "c": payload},
+            )
+            _raise_on_statement_error(raw, f"upsert id={ext_id!r}")
 
     # Max retries for the optimistic concurrency loop in :meth:`update`
     # (mp-93e). SurrealDB 3.0.4 uses MVCC without compare-and-swap; two

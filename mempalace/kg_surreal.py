@@ -217,6 +217,14 @@ class KnowledgeGraphSurreal:
         if existing:
             return str(existing[0]["id"])
 
+        # mp-2um: the schema doc declares
+        # ``extracted_at ON triple TYPE datetime VALUE $value OR time::now()
+        # DEFAULT time::now()`` — but this port uses SCHEMALESS tables, so
+        # the DEFAULT never fires and triples had no provenance timestamp,
+        # regressing parity with the SQLite KG (knowledge_graph.py:88).
+        # Set ``extracted_at = time::now()`` explicitly on the RELATE so
+        # every new edge carries an insertion-time stamp regardless of
+        # whether we later tighten the schema (mp-6gu).
         created = self._db.query(
             (
                 "RELATE $sub->triple->$obj SET "
@@ -227,7 +235,8 @@ class KnowledgeGraphSurreal:
                 "source_closet = $source_closet, "
                 "source_file = $source_file, "
                 "source_drawer_id = $source_drawer_id, "
-                "adapter_name = $adapter_name"
+                "adapter_name = $adapter_name, "
+                "extracted_at = time::now()"
             ),
             {
                 "sub": sub_rec,
