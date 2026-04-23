@@ -85,14 +85,39 @@ def chaos_seed(request) -> int:
 
 @pytest.fixture(autouse=True)
 def _reset_mcp_cache():
-    """Reset the MCP server's cached ChromaDB client/collection between tests."""
+    """Reset the MCP server's cached backend state between tests.
+
+    Chroma: clears the cached ``PersistentClient`` / collection so the next
+    test picks up its own ``palace_path``.
+
+    Surreal: drops the server-side database (via ``drop_palace``) and clears
+    the cached ``PalaceRef`` so two tests with distinct tmp palace paths
+    never share a Surreal DB. The long-lived ``SurrealBackend`` itself is
+    retained — constructing a fresh one per test would re-open the
+    websocket each time and slow the suite significantly (mp-1y1).
+    """
 
     def _clear_cache():
         try:
             from mempalace import mcp_server
 
+            # Chroma-side caches
             mcp_server._client_cache = None
             mcp_server._collection_cache = None
+
+            # Surreal-side caches: drop the previously used palace from the
+            # server so leftover drawer/diary rows cannot leak into the
+            # next test, then forget the cached ref so it is re-derived
+            # from the next test's ``_config.palace_path``.
+            backend = getattr(mcp_server, "_surreal_backend", None)
+            ref = getattr(mcp_server, "_surreal_palace_ref", None)
+            if backend is not None and ref is not None:
+                try:
+                    backend.drop_palace(ref)
+                except Exception:
+                    pass
+            mcp_server._surreal_palace_ref = None
+            mcp_server._surreal_palace_ref_path = None
         except (ImportError, AttributeError):
             pass
 
@@ -156,62 +181,173 @@ def collection(palace_path):
     del client
 
 
+# Sample drawers reused by the backend-agnostic ``seeded_collection`` fixture.
+# Kept at module scope so both the Chroma and Surreal paths seed the *same*
+# documents/metadata — otherwise a test that passes against Chroma might fail
+# against Surreal purely because the inputs drifted (mp-om7).
+_SEED_IDS = [
+    "drawer_proj_backend_aaa",
+    "drawer_proj_backend_bbb",
+    "drawer_proj_frontend_ccc",
+    "drawer_notes_planning_ddd",
+]
+_SEED_DOCUMENTS = [
+    "The authentication module uses JWT tokens for session management. "
+    "Tokens expire after 24 hours. Refresh tokens are stored in HttpOnly cookies.",
+    "Database migrations are handled by Alembic. We use PostgreSQL 15 "
+    "with connection pooling via pgbouncer.",
+    "The React frontend uses TanStack Query for server state management. "
+    "All API calls go through a centralized fetch wrapper.",
+    "Sprint planning: migrate auth to passkeys by Q3. "
+    "Evaluate ChromaDB alternatives for vector search.",
+]
+_SEED_METADATAS = [
+    {
+        "wing": "project",
+        "room": "backend",
+        "source_file": "auth.py",
+        "chunk_index": 0,
+        "added_by": "miner",
+        "filed_at": "2026-01-01T00:00:00",
+    },
+    {
+        "wing": "project",
+        "room": "backend",
+        "source_file": "db.py",
+        "chunk_index": 0,
+        "added_by": "miner",
+        "filed_at": "2026-01-02T00:00:00",
+    },
+    {
+        "wing": "project",
+        "room": "frontend",
+        "source_file": "App.tsx",
+        "chunk_index": 0,
+        "added_by": "miner",
+        "filed_at": "2026-01-03T00:00:00",
+    },
+    {
+        "wing": "notes",
+        "room": "planning",
+        "source_file": "sprint.md",
+        "chunk_index": 0,
+        "added_by": "miner",
+        "filed_at": "2026-01-04T00:00:00",
+    },
+]
+
+
 @pytest.fixture
-def seeded_collection(collection):
-    """Collection with a handful of representative drawers."""
+def seeded_collection(config, palace_path, collection, monkeypatch):
+    """A drawer collection pre-seeded on the currently-configured backend (mp-om7).
+
+    Honours ``MempalaceConfig().backend`` so the same tests exercise either
+    backend by setting ``MEMPALACE_BACKEND=surreal`` (unset = Chroma default).
+    Yields an object implementing :class:`mempalace.backends.base.BaseCollection`;
+    tests should rely only on that abstract surface, not on backend-specific
+    extras.
+
+    Seeding invariants (identical on both backends):
+
+    * Four drawers with deterministic IDs (``drawer_proj_backend_aaa`` etc.)
+    * Metadata carrying ``wing``, ``room``, ``source_file``, ``chunk_index``,
+      ``added_by``, ``filed_at``.
+    * Documents stored verbatim — the MemPalace invariant.
+
+    The parallel ``collection`` fixture is consumed (even under Surreal) and
+    seeded with the same rows. Some Chroma-only call sites — notably
+    ``searcher.search_memories`` (used by ``test_searcher.py``) hard-wire
+    :class:`ChromaBackend` regardless of ``_config.backend`` — still need a
+    populated Chroma palace. Seeding both backends side-by-side keeps them
+    working without adding a compatibility shim at the searcher layer.
+
+    Teardown:
+
+    * Chroma — the ``collection`` fixture deletes its collection on exit.
+    * Surreal — ``backend.drop_palace`` issues ``REMOVE DATABASE`` so no
+      rows leak into the next test. The outer ``_reset_mcp_cache`` autouse
+      fixture issues a second ``drop_palace`` as belt-and-braces (mp-1y1).
+    """
+    # Always populate Chroma at ``palace_path`` — test_searcher.py and any
+    # other Chroma-pinned caller need this even under Surreal.
     collection.add(
-        ids=[
-            "drawer_proj_backend_aaa",
-            "drawer_proj_backend_bbb",
-            "drawer_proj_frontend_ccc",
-            "drawer_notes_planning_ddd",
-        ],
-        documents=[
-            "The authentication module uses JWT tokens for session management. "
-            "Tokens expire after 24 hours. Refresh tokens are stored in HttpOnly cookies.",
-            "Database migrations are handled by Alembic. We use PostgreSQL 15 "
-            "with connection pooling via pgbouncer.",
-            "The React frontend uses TanStack Query for server state management. "
-            "All API calls go through a centralized fetch wrapper.",
-            "Sprint planning: migrate auth to passkeys by Q3. "
-            "Evaluate ChromaDB alternatives for vector search.",
-        ],
-        metadatas=[
-            {
-                "wing": "project",
-                "room": "backend",
-                "source_file": "auth.py",
-                "chunk_index": 0,
-                "added_by": "miner",
-                "filed_at": "2026-01-01T00:00:00",
-            },
-            {
-                "wing": "project",
-                "room": "backend",
-                "source_file": "db.py",
-                "chunk_index": 0,
-                "added_by": "miner",
-                "filed_at": "2026-01-02T00:00:00",
-            },
-            {
-                "wing": "project",
-                "room": "frontend",
-                "source_file": "App.tsx",
-                "chunk_index": 0,
-                "added_by": "miner",
-                "filed_at": "2026-01-03T00:00:00",
-            },
-            {
-                "wing": "notes",
-                "room": "planning",
-                "source_file": "sprint.md",
-                "chunk_index": 0,
-                "added_by": "miner",
-                "filed_at": "2026-01-04T00:00:00",
-            },
-        ],
+        ids=list(_SEED_IDS),
+        documents=list(_SEED_DOCUMENTS),
+        metadatas=[dict(m) for m in _SEED_METADATAS],
     )
-    return collection
+
+    if config.backend != "surreal":
+        # Chroma path: return the ChromaCollection adapter so the yielded
+        # value satisfies :class:`BaseCollection` and tests don't depend on
+        # the raw chromadb API.
+        from mempalace.backends.chroma import ChromaCollection
+
+        yield ChromaCollection(collection)
+        return
+
+    # Surreal path: build/attach a backend targeting the same palace the MCP
+    # server will see, seed drawers on it, and yield its collection handle.
+    import hashlib
+
+    from mempalace import mcp_server
+    from mempalace.backends.base import PalaceRef
+    from mempalace.backends.surreal import SurrealBackend, _embed_texts
+
+    backend = getattr(mcp_server, "_surreal_backend", None)
+    if backend is None:
+        backend = SurrealBackend(
+            url=os.environ.get("MEMPALACE_SURREAL_URL", "ws://127.0.0.1:8000"),
+            username=os.environ.get("MEMPALACE_SURREAL_USER", "root"),
+            password=os.environ.get("MEMPALACE_SURREAL_PASS", "root"),
+        )
+        monkeypatch.setattr(mcp_server, "_surreal_backend", backend)
+
+    # Must match ``mcp_server._get_surreal_backend``'s derivation exactly —
+    # a different prefix would point the fixture at a different Surreal DB
+    # than the one MCP tool handlers read, and the seed would be invisible
+    # to the tests (mp-1y1).
+    palace_id = "mcp_" + hashlib.sha256(palace_path.encode()).hexdigest()[:16]
+    palace_ref = PalaceRef(id=palace_id, local_path=palace_path)
+
+    # Prime the MCP server caches so ``_get_collection()`` — called by every
+    # tool under test — lands on the same palace we seed here.
+    monkeypatch.setattr(mcp_server, "_surreal_palace_ref", palace_ref)
+    monkeypatch.setattr(mcp_server, "_surreal_palace_ref_path", palace_path)
+    monkeypatch.setattr(mcp_server, "_collection_cache", None)
+    monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+    monkeypatch.setattr(mcp_server, "_metadata_cache_time", 0)
+
+    # Start from a clean DB. ``drop_palace`` is idempotent so this is cheap
+    # insurance against a prior run's leftover tables.
+    try:
+        backend.drop_palace(palace_ref)
+    except Exception:
+        pass
+
+    col = backend.get_collection(
+        palace=palace_ref,
+        collection_name=config.collection_name,
+        create=True,
+    )
+
+    # Surreal's HNSW index is dim-locked on first write, and the collection
+    # does not auto-embed documents (Chroma does). Pre-compute vectors with
+    # the same embedder the MCP server uses so vector search at query time
+    # walks the same embedding space.
+    embeddings = _embed_texts(list(_SEED_DOCUMENTS))
+    col.add(
+        ids=list(_SEED_IDS),
+        documents=list(_SEED_DOCUMENTS),
+        metadatas=[dict(m) for m in _SEED_METADATAS],
+        embeddings=embeddings,
+    )
+    try:
+        yield col
+    finally:
+        try:
+            backend.drop_palace(palace_ref)
+        except Exception:
+            pass
 
 
 @pytest.fixture

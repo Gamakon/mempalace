@@ -662,6 +662,89 @@ def test_close_palace_evicts_connection(surreal_backend, palace_ref):
     assert db_name not in surreal_backend._conns
 
 
+def test_drop_palace_purges_server_side_state(surreal_backend, palace_ref):
+    """mp-1y1: ``drop_palace`` must actually REMOVE DATABASE on the server.
+
+    ``close_palace`` only evicts the cached handle — the underlying Surreal
+    database survives, which is exactly what caused cross-test state leaks
+    when the MCP server kept a stale ``PalaceRef`` alive across test
+    invocations. ``drop_palace`` is the primitive test fixtures (and the
+    repair/nuke CLI paths) need to guarantee true per-palace isolation.
+
+    This regression test writes a drawer, drops the palace, re-creates it,
+    and asserts the drawer is gone. If ``drop_palace`` were a no-op — or
+    merely closed the connection — the second ``get_collection`` would
+    expose the leftover row and ``count()`` would be 1.
+    """
+    col = surreal_backend.get_collection(
+        palace=palace_ref, collection_name="mempalace_drawers", create=True
+    )
+    col.add(
+        ids=["drawer_regression_1"],
+        documents=["verbatim content that MUST NOT leak across tests"],
+        metadatas=[{"wing": "test", "room": "regression"}],
+        embeddings=[[0.1] * 384],
+    )
+    assert col.count() == 1
+
+    # Destroy the server-side DB.
+    surreal_backend.drop_palace(palace_ref)
+
+    # Re-bootstrap the same palace; the drawer written above must not
+    # survive the drop. Use ``create=True`` so the fresh DB gets the
+    # schema DDL — mirroring what a new test or a fresh ``mempalace init``
+    # would do.
+    col2 = surreal_backend.get_collection(
+        palace=palace_ref, collection_name="mempalace_drawers", create=True
+    )
+    assert col2.count() == 0, (
+        "drop_palace must purge server-side rows; a non-zero count here means "
+        "two palaces with the same id would leak state across them."
+    )
+
+
+def test_distinct_palace_paths_do_not_share_surreal_db(surreal_backend):
+    """mp-1y1: two palaces with distinct paths must have distinct Surreal DBs.
+
+    This is the direct, backend-level guard for the MCP-server-side bug that
+    caused mp-1y1: the cached ``_surreal_palace_ref`` was not re-derived when
+    ``_config.palace_path`` changed, so two tests ran against the same
+    Surreal DB and diary entries from one bled into the next.
+
+    The fix lives in ``mcp_server._get_surreal_backend`` (re-derive the
+    ref on palace_path change), but we also pin the backend invariant here:
+    writing to palace A and reading from palace B (different ``PalaceRef.id``)
+    MUST return zero rows.
+    """
+    ref_a = PalaceRef(id=f"palace_{uuid.uuid4().hex[:10]}_a", local_path="/tmp/a")
+    ref_b = PalaceRef(id=f"palace_{uuid.uuid4().hex[:10]}_b", local_path="/tmp/b")
+
+    col_a = surreal_backend.get_collection(
+        palace=ref_a, collection_name="mempalace_drawers", create=True
+    )
+    col_b = surreal_backend.get_collection(
+        palace=ref_b, collection_name="mempalace_drawers", create=True
+    )
+
+    col_a.add(
+        ids=["a_only"],
+        documents=["only in palace A"],
+        metadatas=[{"wing": "a", "room": "a"}],
+        embeddings=[[0.1] * 384],
+    )
+
+    assert col_a.count() == 1
+    assert col_b.count() == 0, (
+        "palace B must not observe palace A's drawers — if it does, the "
+        "_safe_db_name derivation is collapsing distinct PalaceRefs onto "
+        "one Surreal DB (mp-1y1)."
+    )
+
+    # And after a drop of A, B is still untouched.
+    surreal_backend.drop_palace(ref_a)
+    assert col_b.count() == 0
+
+
 def test_close_marks_backend_closed(surreal_backend, palace_ref):
     from mempalace.backends import BackendClosedError
 

@@ -8,6 +8,7 @@ via monkeypatch to avoid touching real data.
 
 from datetime import datetime
 import json
+import os
 import sys
 
 import pytest
@@ -26,15 +27,43 @@ def _get_collection(palace_path, create=False):
 
     Returns (client, collection) so callers can clean up the client
     when they are done.
+
+    Under ``MEMPALACE_BACKEND=surreal`` we also bootstrap the Surreal-side
+    database so that subsequent ``tool_*`` calls against an empty but
+    existing palace behave the same as they do under Chroma (where the
+    ``PersistentClient`` call above already created the backing store).
+    This parallels the Chroma fixture's semantics and removes the need
+    for individual tests to be backend-aware (mp-1y1).
     """
+    import os as _os
+
     import chromadb
 
     client = chromadb.PersistentClient(path=palace_path)
     if create:
-        return (
-            client,
-            client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"}),
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
         )
+
+        # Surreal parity: ensure the Surreal DB for this palace exists and is
+        # bootstrapped so ``tool_diary_read`` / ``tool_status`` on an empty
+        # palace report "no entries" rather than "no palace". No-op under
+        # Chroma.
+        if _os.environ.get("MEMPALACE_BACKEND", "").lower() == "surreal":
+            try:
+                from mempalace import mcp_server as _mcp
+
+                if getattr(_mcp, "_config", None) is not None and (
+                    _mcp._config.palace_path == palace_path
+                ):
+                    _mcp._get_collection(create=True)
+            except Exception:
+                # Best-effort — if Surreal isn't configured (e.g. unit tests
+                # that only exercise Chroma) we leave the chroma collection
+                # alone and let the test itself surface any mismatch.
+                pass
+
+        return (client, col)
     return client, client.get_collection("mempalace_drawers")
 
 
@@ -218,7 +247,16 @@ class TestReadTools:
         After `mempalace init`, chroma.sqlite3 exists but the mempalace_drawers
         collection has not been created (no mine or add_drawer yet).  Status
         should return total_drawers: 0, not 'No palace found'.
+
+        Chroma-specific scenario: under Surreal the palace lives server-side
+        and there is no equivalent of "DB file exists but collection does
+        not" — the drawer table either exists (palace is bootstrapped) or
+        it does not (no palace). That case is covered by
+        ``test_no_palace_returns_error`` under Surreal (mp-1y1).
         """
+        if os.environ.get("MEMPALACE_BACKEND", "").lower() == "surreal":
+            pytest.skip("Chroma-specific cold-start scenario; no Surreal analogue")
+
         import chromadb
 
         _patch_mcp_server(monkeypatch, config, kg)
@@ -327,16 +365,33 @@ class TestReadTools:
 # ── Search Tool ─────────────────────────────────────────────────────────
 
 
+def _search_hits(result):
+    """Extract the hit list from a ``tool_search`` result (backend-agnostic).
+
+    Chroma's search path routes through ``searcher.search_memories`` which
+    returns ``{"results": [...]}``. The Surreal path goes through
+    ``_search_surreal`` (mcp_server.py) which returns ``{"hits": [...]}``.
+    Tests don't care about the wrapper key — they only care that the list
+    of drawers surfaced matches expectations. Accept either shape so the
+    same test passes against either backend (mp-om7).
+    """
+    if "results" in result:
+        return result["results"]
+    if "hits" in result:
+        return result["hits"]
+    return []
+
+
 class TestSearchTool:
     def test_search_basic(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_search
 
         result = tool_search(query="JWT authentication tokens")
-        assert "results" in result
-        assert len(result["results"]) > 0
+        hits = _search_hits(result)
+        assert len(hits) > 0
         # Top result should be the auth drawer
-        top = result["results"][0]
+        top = hits[0]
         assert "JWT" in top["text"] or "authentication" in top["text"].lower()
 
     def test_search_with_wing_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
@@ -344,14 +399,16 @@ class TestSearchTool:
         from mempalace.mcp_server import tool_search
 
         result = tool_search(query="planning", wing="notes")
-        assert all(r["wing"] == "notes" for r in result["results"])
+        hits = _search_hits(result)
+        assert all(r["wing"] == "notes" for r in hits)
 
     def test_search_with_room_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_search
 
         result = tool_search(query="database", room="backend")
-        assert all(r["room"] == "backend" for r in result["results"])
+        hits = _search_hits(result)
+        assert all(r["room"] == "backend" for r in hits)
 
     def test_search_min_similarity_backwards_compat(
         self, monkeypatch, config, palace_path, seeded_collection, kg
@@ -360,14 +417,14 @@ class TestSearchTool:
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_search
 
-        # Old name should work
+        # Old name should work — just confirm the result carries a hit list.
         result = tool_search(query="JWT", min_similarity=1.5)
-        assert "results" in result
+        assert "results" in result or "hits" in result
 
         # Old name takes precedence when both provided
         result_strict = tool_search(query="JWT", max_distance=999.0, min_similarity=0.01)
         result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=999.0)
-        assert len(result_strict["results"]) <= len(result_loose["results"])
+        assert len(_search_hits(result_strict)) <= len(_search_hits(result_loose))
 
     def test_list_rooms_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -476,9 +533,9 @@ class TestWriteTools:
 
         assert result1["success"] is True
         assert result2["success"] is True
-        assert (
-            result1["drawer_id"] != result2["drawer_id"]
-        ), "Documents with shared header but different content must have distinct drawer IDs"
+        assert result1["drawer_id"] != result2["drawer_id"], (
+            "Documents with shared header but different content must have distinct drawer IDs"
+        )
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -739,6 +796,69 @@ class TestDiaryTools:
         assert read_result["total"] == 2
         assert entry1 in contents
         assert entry2 in contents
+
+    def test_two_configs_with_different_palace_paths_do_not_share_state(
+        self, monkeypatch, tmp_dir, kg
+    ):
+        """mp-1y1: swapping ``_config.palace_path`` must re-derive the Surreal ref.
+
+        Direct regression for the cached-PalaceRef bug that made the whole
+        TestDiaryTools class brittle under Surreal. We simulate what pytest
+        does between two tests: patch in config A, write a diary entry,
+        patch in config B pointing at a different palace path, and assert
+        the read against B sees zero entries. Before the fix this would
+        return 1 (or whatever the previous test had written) because the
+        MCP module cached the first ref and never re-derived it.
+
+        This covers both backends — under Chroma each palace_path is its
+        own SQLite file so isolation is automatic, but the assertion holds
+        either way, pinning the invariant.
+        """
+        import json
+
+        from mempalace import mcp_server
+        from mempalace.config import MempalaceConfig
+
+        def _make_config(subdir: str) -> MempalaceConfig:
+            pp = os.path.join(tmp_dir, subdir, "palace")
+            os.makedirs(pp)
+            cfg_dir = os.path.join(tmp_dir, subdir, "config")
+            os.makedirs(cfg_dir)
+            with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+                json.dump({"palace_path": pp}, f)
+            return MempalaceConfig(config_dir=cfg_dir)
+
+        cfg_a = _make_config("palace_a")
+        cfg_b = _make_config("palace_b")
+
+        # Palace A: write a diary entry.
+        monkeypatch.setattr(mcp_server, "_config", cfg_a)
+        monkeypatch.setattr(mcp_server, "_kg", kg)
+        _client, _col = _get_collection(cfg_a.palace_path, create=True)
+        del _client
+
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
+
+        w = tool_diary_write(
+            agent_name="LeakSentinel",
+            entry="this entry belongs to palace A only",
+            topic="regression",
+        )
+        assert w["success"] is True
+
+        # Palace B: a completely different palace. Reading here MUST NOT
+        # see palace A's entry — if it does, the backend (or its cache)
+        # is leaking state across palaces.
+        monkeypatch.setattr(mcp_server, "_config", cfg_b)
+        _client, _col = _get_collection(cfg_b.palace_path, create=True)
+        del _client
+
+        r = tool_diary_read(agent_name="LeakSentinel")
+        # ``total`` is only present when the palace has entries; an empty
+        # palace under either backend returns ``entries: []`` and no total.
+        assert r.get("entries") == [], (
+            f"palace B saw entries from palace A — state leak across palace paths: {r}"
+        )
 
 
 # ── Cache Invalidation (inode/mtime) ──────────────────────────────────

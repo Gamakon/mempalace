@@ -129,6 +129,14 @@ _kg = _init_kg()
 # Surreal backend instance (lazy, only created when backend == "surreal").
 _surreal_backend = None
 _surreal_palace_ref = None
+# Palace path the cached ``_surreal_palace_ref`` was derived from. When
+# ``_config.palace_path`` changes (test fixtures swap configs, a user
+# ``mempalace use`` repoints the palace, etc.) the cached ref must be
+# recomputed so that one palace path maps to exactly one Surreal database.
+# Without this guard a stale ref leaks writes into an unrelated palace
+# — which is exactly how cross-test state leaks snuck in under the pytest
+# suite (mp-1y1).
+_surreal_palace_ref_path = None
 
 
 def _get_surreal_backend():
@@ -138,8 +146,13 @@ def _get_surreal_backend():
     stable hash of the palace path (Surreal uses the id as its DB name, so
     it needs to be filesystem-independent and stable across restarts).
     ``local_path`` carries the palace dir for adapters that want it.
+
+    The cached ref is invalidated when ``_config.palace_path`` changes so
+    that two palaces with distinct paths never share a Surreal database —
+    required for test isolation and for the CLI's ``mempalace use`` flow
+    (mp-1y1).
     """
-    global _surreal_backend, _surreal_palace_ref
+    global _surreal_backend, _surreal_palace_ref, _surreal_palace_ref_path
     if _surreal_backend is None:
         from .backends.surreal import SurrealBackend
 
@@ -148,9 +161,11 @@ def _get_surreal_backend():
             username=os.environ.get("MEMPALACE_SURREAL_USER", "root"),
             password=os.environ.get("MEMPALACE_SURREAL_PASS", "root"),
         )
-    if _surreal_palace_ref is None:
-        palace_id = "mcp_" + hashlib.sha256(_config.palace_path.encode()).hexdigest()[:16]
-        _surreal_palace_ref = PalaceRef(id=palace_id, local_path=_config.palace_path)
+    current_path = _config.palace_path
+    if _surreal_palace_ref is None or _surreal_palace_ref_path != current_path:
+        palace_id = "mcp_" + hashlib.sha256(current_path.encode()).hexdigest()[:16]
+        _surreal_palace_ref = PalaceRef(id=palace_id, local_path=current_path)
+        _surreal_palace_ref_path = current_path
     return _surreal_backend, _surreal_palace_ref
 
 

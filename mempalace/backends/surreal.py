@@ -1841,6 +1841,51 @@ class SurrealBackend(BaseBackend):
         if conn is not None:
             _safe_close(conn)
 
+    def drop_palace(self, palace: PalaceRef) -> None:
+        """Destroy the server-side database for ``palace`` and evict cached state.
+
+        Unlike :meth:`close_palace` — which merely drops the local connection
+        handle and leaves the Surreal database intact — ``drop_palace`` issues
+        ``REMOVE DATABASE`` on the server so no drawers, closets, or palace
+        metadata survive. Idempotent: dropping a palace that was never created
+        is a no-op (``IF EXISTS``).
+
+        This is the server-mode analogue of deleting a Chroma palace dir. It
+        is the primitive test fixtures and administrative tooling need to
+        guarantee per-palace isolation in a long-lived Surreal process
+        (mp-1y1).
+        """
+        if self._closed:
+            return
+        if not isinstance(palace, PalaceRef):
+            return
+        db_name = _safe_db_name(palace)
+
+        # Close any cached handle first: dropping the DB out from underneath
+        # a live ``USE DB`` session leaves the handle in an undefined state.
+        with self._lock:
+            conn = self._conns.pop(db_name, None)
+            self._bootstrapped.pop(db_name, None)
+        if conn is not None:
+            _safe_close(conn)
+
+        # Open a short-lived admin connection bound to the namespace so the
+        # ``REMOVE DATABASE`` statement lands in the right scope. We do NOT
+        # cache this connection — the whole point is to tear the DB down.
+        try:
+            from surrealdb import Surreal  # late import
+
+            admin = Surreal(self._url)
+            admin.signin({"username": self._username, "password": self._password})
+            ns = self._namespace
+            admin.query(f"USE NS {ns}; REMOVE DATABASE IF EXISTS {db_name};")
+            _safe_close(admin)
+        except Exception:
+            # Best-effort teardown — failures here are logged but not raised
+            # so a missing server at shutdown can't mask the real test
+            # failure. In practice REMOVE DATABASE is idempotent and safe.
+            logger.exception("drop_palace: REMOVE DATABASE %r failed", db_name)
+
     def close(self) -> None:
         with self._lock:
             conns = list(self._conns.values())
