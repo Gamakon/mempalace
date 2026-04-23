@@ -72,6 +72,25 @@ def unregister(name: str) -> None:
         _instances.pop(name, None)
 
 
+def register_instance(name: str, instance: BaseBackend) -> None:
+    """Install a pre-built backend ``instance`` as the cached singleton for ``name``.
+
+    Used by callers (e.g. the MCP server, test fixtures) that need to share
+    a specific backend instance — configured with a custom url / namespace /
+    palace — with other in-tree consumers that resolve their backend via
+    :func:`get_backend`. Without this, the MCP server's own
+    ``SurrealBackend`` (created from ``MEMPALACE_SURREAL_URL`` env vars) and
+    the registry's cached instance could diverge, splitting a palace's
+    writes and reads across two Surreal connections that talk to different
+    namespaces.
+
+    Replaces any previously cached instance for ``name`` (the caller is
+    responsible for closing the old one if it held server connections).
+    """
+    with _lock:
+        _instances[name] = instance
+
+
 def _discover_entry_points() -> None:
     """Load entry-point-declared backends once per process."""
     global _discovered

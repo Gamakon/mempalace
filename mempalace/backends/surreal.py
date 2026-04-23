@@ -350,6 +350,46 @@ def _raise_on_statement_error(
     raise BackendError(f"surreal backend {context}: {message}")
 
 
+def _safe_info_query(
+    conn,
+    statement: str,
+    *,
+    op_name: str,
+    retry_helper=None,
+) -> dict:
+    """Run an ``INFO FOR ...`` query and normalize the result to a dict.
+
+    SurrealDB 3.0.4 has a wart: under concurrent DDL load ``INFO FOR DB``
+    (and siblings) sometimes returns an error STRING as the query result
+    rather than raising (mp-mta). Shape mismatches — strings, ``None``,
+    ints, empty lists — get coerced to ``{}`` with a WARN so matcher/SDK
+    drift stays observable. Real exceptions still propagate.
+
+    ``retry_helper`` defaults to :func:`_retry_on_conflict` so INFO reads
+    gain the same catalog-race resilience other DDL paths have; pass a
+    no-op for unit tests that want to skip the backoff.
+    """
+    if retry_helper is None:
+        retry_helper = _retry_on_conflict
+
+    def _do_query():
+        return conn.query(statement)
+
+    result = retry_helper(_do_query, op_name=op_name)()
+
+    if isinstance(result, list):
+        result = result[0] if result else None
+    if isinstance(result, dict):
+        return result
+
+    logger.warning(
+        "mp-mta: INFO query returned unexpected shape (op=%s, exc_str=%r) — coercing to empty dict",
+        op_name,
+        result,
+    )
+    return {}
+
+
 def _safe_close(conn) -> None:
     """Close a Surreal connection, tolerating SDK variants that no-op close.
 
@@ -780,6 +820,11 @@ class SurrealCollection(BaseCollection):
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_writes(documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings)
+        # Chroma-parity: if the caller supplied documents but no embeddings,
+        # auto-embed using the same default embedder Chroma uses so vector
+        # search works without the caller needing backend-aware glue code.
+        if embeddings is None and documents is not None:
+            embeddings = _embed_texts(list(documents))
         # Reject dim-mismatched writes BEFORE they hit Surreal (mp-s58) and
         # lazy-create the HNSW index using the observed dim (mp-j19).
         observed = self._enforce_write_dims(embeddings)
@@ -808,6 +853,9 @@ class SurrealCollection(BaseCollection):
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_writes(documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings)
+        # Chroma-parity auto-embedding (see :meth:`add`).
+        if embeddings is None and documents is not None:
+            embeddings = _embed_texts(list(documents))
         observed = self._enforce_write_dims(embeddings)
         if observed is not None:
             self._ensure_hnsw_index(observed)
@@ -1816,21 +1864,12 @@ class SurrealBackend(BaseBackend):
         conn = self._connect(db_name)
 
         # Detect "does the palace exist?" via a cheap INFO query. The
-        # high-level SDK passes server-side error strings through as the
-        # return value (rather than raising), so be defensive about the
-        # shape — if we see a non-dict we treat the palace as "not yet
-        # bootstrapped" and let the create-path run. Also wrap in the
-        # conflict retry helper: under concurrent first-writers the
-        # INFO read can coincide with catalog DDL and flap. (mp-33y)
-        def _info_for_db():
-            return conn.query("INFO FOR DB")
-
-        info = _retry_on_conflict(_info_for_db, op_name="get_collection.info")() or {}
-        if isinstance(info, list):
-            info = info[0] if info else {}
-        if not isinstance(info, dict):
-            info = {}
-        existing_tables = set((info or {}).get("tables") or {})
+        # hardened ``_safe_info_query`` helper (mp-mta) tolerates SurrealDB
+        # 3.0.4's error-string return wart and wraps in the catalog-race
+        # retry helper (mp-33y), so a non-dict result here is already
+        # normalised to ``{}``.
+        info = _safe_info_query(conn, "INFO FOR DB", op_name="get_collection.info")
+        existing_tables = set(info.get("tables") or {})
 
         palace_present = "drawer" in existing_tables or "closet" in existing_tables
         if not create and not palace_present:

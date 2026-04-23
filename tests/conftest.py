@@ -118,6 +118,18 @@ def _reset_mcp_cache():
                     pass
             mcp_server._surreal_palace_ref = None
             mcp_server._surreal_palace_ref_path = None
+            # Forget any backend instance the MCP server installed into the
+            # shared registry (mp-0ii) so the next test starts from a clean
+            # slate. ``palace.get_collection`` will rebuild a fresh backend
+            # the first time it's called — or the next seeded_collection
+            # fixture will install its own.
+            try:
+                from mempalace.backends.registry import _instances, _lock
+
+                with _lock:
+                    _instances.pop("surreal", None)
+            except Exception:
+                pass
         except (ImportError, AttributeError):
             pass
 
@@ -239,13 +251,11 @@ _SEED_METADATAS = [
 
 @pytest.fixture
 def seeded_collection(config, palace_path, collection, monkeypatch):
-    """A drawer collection pre-seeded on the currently-configured backend (mp-om7).
+    """A drawer collection pre-seeded on the currently-configured backend (mp-om7, mp-0ii).
 
     Honours ``MempalaceConfig().backend`` so the same tests exercise either
     backend by setting ``MEMPALACE_BACKEND=surreal`` (unset = Chroma default).
-    Yields an object implementing :class:`mempalace.backends.base.BaseCollection`;
-    tests should rely only on that abstract surface, not on backend-specific
-    extras.
+    Yields an object implementing :class:`mempalace.backends.base.BaseCollection`.
 
     Seeding invariants (identical on both backends):
 
@@ -254,12 +264,11 @@ def seeded_collection(config, palace_path, collection, monkeypatch):
       ``added_by``, ``filed_at``.
     * Documents stored verbatim — the MemPalace invariant.
 
-    The parallel ``collection`` fixture is consumed (even under Surreal) and
-    seeded with the same rows. Some Chroma-only call sites — notably
-    ``searcher.search_memories`` (used by ``test_searcher.py``) hard-wire
-    :class:`ChromaBackend` regardless of ``_config.backend`` — still need a
-    populated Chroma palace. Seeding both backends side-by-side keeps them
-    working without adding a compatibility shim at the searcher layer.
+    Seeds ONLY the configured backend (mp-0ii). The prior dual-seed — always
+    populating Chroma regardless of backend — existed because
+    ``searcher.search_memories`` hard-wired :class:`ChromaBackend`; mp-0ii
+    routes the searcher through the configured backend so the Chroma leg is
+    now dead weight under Surreal.
 
     Teardown:
 
@@ -268,20 +277,17 @@ def seeded_collection(config, palace_path, collection, monkeypatch):
       rows leak into the next test. The outer ``_reset_mcp_cache`` autouse
       fixture issues a second ``drop_palace`` as belt-and-braces (mp-1y1).
     """
-    # Always populate Chroma at ``palace_path`` — test_searcher.py and any
-    # other Chroma-pinned caller need this even under Surreal.
-    collection.add(
-        ids=list(_SEED_IDS),
-        documents=list(_SEED_DOCUMENTS),
-        metadatas=[dict(m) for m in _SEED_METADATAS],
-    )
-
     if config.backend != "surreal":
-        # Chroma path: return the ChromaCollection adapter so the yielded
-        # value satisfies :class:`BaseCollection` and tests don't depend on
-        # the raw chromadb API.
+        # Chroma path: seed the ``collection`` fixture directly and yield
+        # the ``ChromaCollection`` adapter so the yielded value satisfies
+        # :class:`BaseCollection`.
         from mempalace.backends.chroma import ChromaCollection
 
+        collection.add(
+            ids=list(_SEED_IDS),
+            documents=list(_SEED_DOCUMENTS),
+            metadatas=[dict(m) for m in _SEED_METADATAS],
+        )
         yield ChromaCollection(collection)
         return
 
@@ -301,6 +307,13 @@ def seeded_collection(config, palace_path, collection, monkeypatch):
             password=os.environ.get("MEMPALACE_SURREAL_PASS", "root"),
         )
         monkeypatch.setattr(mcp_server, "_surreal_backend", backend)
+
+    # Mirror the backend into the shared registry (mp-0ii) so
+    # ``palace.get_collection`` / ``searcher.search_memories`` resolve the
+    # same instance as the MCP tool handlers use.
+    from mempalace.backends import register_instance
+
+    register_instance("surreal", backend)
 
     # Must match ``mcp_server._get_surreal_backend``'s derivation exactly —
     # a different prefix would point the fixture at a different Surreal DB

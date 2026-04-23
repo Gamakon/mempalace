@@ -365,30 +365,13 @@ class TestReadTools:
 # ── Search Tool ─────────────────────────────────────────────────────────
 
 
-def _search_hits(result):
-    """Extract the hit list from a ``tool_search`` result (backend-agnostic).
-
-    Chroma's search path routes through ``searcher.search_memories`` which
-    returns ``{"results": [...]}``. The Surreal path goes through
-    ``_search_surreal`` (mcp_server.py) which returns ``{"hits": [...]}``.
-    Tests don't care about the wrapper key — they only care that the list
-    of drawers surfaced matches expectations. Accept either shape so the
-    same test passes against either backend (mp-om7).
-    """
-    if "results" in result:
-        return result["results"]
-    if "hits" in result:
-        return result["hits"]
-    return []
-
-
 class TestSearchTool:
     def test_search_basic(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_search
 
         result = tool_search(query="JWT authentication tokens")
-        hits = _search_hits(result)
+        hits = result["results"]
         assert len(hits) > 0
         # Top result should be the auth drawer
         top = hits[0]
@@ -399,7 +382,7 @@ class TestSearchTool:
         from mempalace.mcp_server import tool_search
 
         result = tool_search(query="planning", wing="notes")
-        hits = _search_hits(result)
+        hits = result["results"]
         assert all(r["wing"] == "notes" for r in hits)
 
     def test_search_with_room_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
@@ -407,7 +390,7 @@ class TestSearchTool:
         from mempalace.mcp_server import tool_search
 
         result = tool_search(query="database", room="backend")
-        hits = _search_hits(result)
+        hits = result["results"]
         assert all(r["room"] == "backend" for r in hits)
 
     def test_search_min_similarity_backwards_compat(
@@ -417,14 +400,14 @@ class TestSearchTool:
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_search
 
-        # Old name should work — just confirm the result carries a hit list.
+        # Old name should work — canonical shape always carries `results`.
         result = tool_search(query="JWT", min_similarity=1.5)
-        assert "results" in result or "hits" in result
+        assert "results" in result
 
         # Old name takes precedence when both provided
         result_strict = tool_search(query="JWT", max_distance=999.0, min_similarity=0.01)
         result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=999.0)
-        assert len(_search_hits(result_strict)) <= len(_search_hits(result_loose))
+        assert len(result_strict["results"]) <= len(result_loose["results"])
 
     def test_list_rooms_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)

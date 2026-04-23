@@ -4,9 +4,18 @@ import shutil
 from pathlib import Path
 
 import chromadb
+import pytest
 
 from mempalace.convo_miner import mine_convos
 from mempalace.palace import file_already_mined
+
+# Chroma-only: these tests instantiate ``chromadb.PersistentClient`` directly
+# to read back the palace contents, so they cannot meaningfully run against
+# a Surreal-backed palace.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("MEMPALACE_BACKEND", "chroma") != "chroma",
+    reason="Chroma-only tests: they poke PersistentClient directly",
+)
 
 
 def test_convo_mining():

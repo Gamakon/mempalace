@@ -363,6 +363,13 @@ def cmd_migrate_kg_to_surreal(args):
     print(f"  Target (Surreal): {args.url} NS={args.namespace} DB={args.database}\n")
 
     try:
+        from .migrate_kg import DEFAULT_KG_BATCH_SIZE
+
+        kg_batch_size = (
+            args.kg_batch_size
+            if getattr(args, "kg_batch_size", None)
+            else DEFAULT_KG_BATCH_SIZE
+        )
         result = migrate_kg_to_surreal(
             sqlite_path,
             url=args.url,
@@ -371,6 +378,7 @@ def cmd_migrate_kg_to_surreal(args):
             namespace=args.namespace,
             database=args.database,
             verify_sample_size=args.verify_sample,
+            kg_batch_size=kg_batch_size,
         )
     except Exception as exc:  # pragma: no cover - surfaces connection errors
         print(f"\n  Migration failed: {exc}")
@@ -980,6 +988,16 @@ def main():
         type=int,
         default=10,
         help="How many random triples to round-trip verify after migration (0 disables)",
+    )
+    p_migrate_kg.add_argument(
+        "--kg-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Triples per Surreal write batch (default: 100). Raise for "
+            "faster bulk loads if the Surreal frame size allows; lower "
+            "for very wide triples. mp-ayu."
+        ),
     )
 
     # verify-migration (mp-dju) — audit a completed Chroma+SQLite -> SurrealDB migration.

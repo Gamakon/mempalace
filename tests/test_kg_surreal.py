@@ -193,6 +193,153 @@ class TestAddTriple:
         assert rows[0]["valid_to"] == "2024-06-01"
         assert rows[0]["current"] is False
 
+    def test_add_triples_batch_dedup_and_scale(self, kg):
+        """mp-ayu: ``add_triples_batch`` collapses N triples into 3
+        round-trips, and preserves the open-triple dedup contract of
+        :meth:`add_triple`.
+
+        We cover three dedup shapes in one batch:
+
+        1. **Fresh writes** — 40 new (sub, pred, obj) combinations.
+        2. **Intra-batch duplicates** — 5 triples whose SPO is already
+           in this same batch (two "first write wins" cases repeated).
+           Expected: shares the id of the first occurrence, no extra rows.
+        3. **DB-side duplicates** — 5 triples whose SPO was already
+           written via a prior single :meth:`add_triple` call. Expected:
+           returns the existing id, no extra rows.
+
+        Total: 50 triples submitted, 40 new + 10 dedup hits, final row
+        count = 41 (40 fresh + 1 seeded = 41) so we can prove no
+        phantom rows from the batch.
+        """
+        # 1 seeded triple to exercise the "DB already has this open
+        # triple" dedup arm of the batch.
+        seeded_id = kg.add_triple("preexisting_sub", "knows", "preexisting_obj")
+        assert kg.stats()["triples"] == 1
+
+        triples: list[dict] = []
+        # 40 fresh open triples.
+        for i in range(40):
+            triples.append(
+                {
+                    "subject": f"person_{i}",
+                    "predicate": "knows",
+                    "obj": f"topic_{i}",
+                }
+            )
+        # 5 intra-batch dupes — the first 5 triples repeated verbatim.
+        # These must collapse to the ids of the originals.
+        for i in range(5):
+            triples.append(
+                {
+                    "subject": f"person_{i}",
+                    "predicate": "knows",
+                    "obj": f"topic_{i}",
+                }
+            )
+        # 5 DB-side dupes — match the already-written ``preexisting``
+        # triple so the pre-check arm fires and returns the seeded id.
+        for _ in range(5):
+            triples.append(
+                {
+                    "subject": "preexisting_sub",
+                    "predicate": "knows",
+                    "obj": "preexisting_obj",
+                }
+            )
+
+        ids = kg.add_triples_batch(triples)
+        assert len(ids) == 50
+
+        # Row count is the load-bearing assertion — dedup failures
+        # would show up as extra rows here.
+        assert kg.stats()["triples"] == 41, "batch must not create duplicate open triples"
+
+        # Intra-batch dupes should return the same id as the first copy.
+        for i in range(5):
+            assert ids[40 + i] == ids[i], f"intra-batch dedup failed at offset {40 + i}"
+
+        # DB-side dupes should return the id of the seeded triple.
+        for i in range(5):
+            assert ids[45 + i] == seeded_id, f"DB dedup failed at offset {45 + i}"
+
+        # Running the same batch again must be a no-op (idempotency).
+        ids2 = kg.add_triples_batch(triples)
+        assert ids2 == ids, "batched re-run must return identical ids"
+        assert kg.stats()["triples"] == 41
+
+    def test_add_triples_batch_closed_triples_dedup_on_full_key(self, kg):
+        """Closed triples dedup on the full ``(sub, pred, obj,
+        valid_from, valid_to)`` tuple — same rule as :meth:`add_triple`.
+        A closed triple with a *different* span is a distinct row.
+        """
+        triples = [
+            {
+                "subject": "Alice",
+                "predicate": "works_at",
+                "obj": "Acme",
+                "valid_from": "2020-01-01",
+                "valid_to": "2022-01-01",
+            },
+            {
+                "subject": "Alice",
+                "predicate": "works_at",
+                "obj": "Acme",
+                "valid_from": "2022-01-02",
+                "valid_to": "2024-01-01",
+            },
+        ]
+        ids = kg.add_triples_batch(triples)
+        assert len(ids) == 2 and ids[0] != ids[1]
+        assert kg.stats()["triples"] == 2
+
+        # Re-running: both hit the closed-triple dedup path.
+        ids2 = kg.add_triples_batch(triples)
+        assert ids2 == ids
+        assert kg.stats()["triples"] == 2
+
+    def test_add_triples_batch_empty_is_noop(self, kg):
+        assert kg.add_triples_batch([]) == []
+
+    def test_add_triples_batch_preserves_provenance(self, kg):
+        """Every provenance field must land on the triple, matching
+        :meth:`add_triple`'s contract."""
+        kg.add_triples_batch(
+            [
+                {
+                    "subject": "Alice",
+                    "predicate": "works_at",
+                    "obj": "Acme",
+                    "valid_from": "2020-01-01",
+                    "confidence": 0.87,
+                    "source_closet": "personal/2020-01",
+                    "source_file": "/convos/hire.md",
+                    "source_drawer_id": "drawer_abc",
+                    "adapter_name": "general",
+                    "extracted_at": "2020-01-15T12:00:00Z",
+                }
+            ]
+        )
+        rows = kg._db.query(
+            (
+                "SELECT predicate, valid_from, confidence, source_closet, "
+                "source_file, source_drawer_id, adapter_name, extracted_at "
+                "FROM triple"
+            )
+        )
+        assert rows
+        r = rows[0]
+        assert r["predicate"] == "works_at"
+        assert r["valid_from"] == "2020-01-01"
+        assert abs(r["confidence"] - 0.87) < 1e-6
+        assert r["source_closet"] == "personal/2020-01"
+        assert r["source_file"] == "/convos/hire.md"
+        assert r["source_drawer_id"] == "drawer_abc"
+        assert r["adapter_name"] == "general"
+        # extracted_at is stored as a Surreal datetime — just confirm
+        # the source date made it through.
+        assert "2020-01-15" in str(r["extracted_at"])
+
     def test_add_triple_records_extracted_at(self, kg):
         """mp-2um: every new triple must carry an ``extracted_at`` stamp
         for provenance parity with the SQLite KG

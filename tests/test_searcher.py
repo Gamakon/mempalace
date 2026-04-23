@@ -150,9 +150,13 @@ class TestSearchCLI:
         with pytest.raises(SearchError, match="No palace found"):
             search("anything", str(tmp_path / "missing"))
 
-    def test_search_no_results(self, palace_path, collection, capsys):
+    def test_search_no_results(self, palace_path, capsys):
         """Empty collection returns no results message."""
-        # collection is empty (no seeded data)
+        # Bootstrap an empty collection on whichever backend is configured so
+        # the searcher finds a palace (no seeded data, no results).
+        from mempalace.palace import get_collection
+
+        get_collection(palace_path, create=True)
         result = search("xyzzy_nonexistent_query", palace_path, n_results=1)
         captured = capsys.readouterr()
         # Either prints "No results" or returns None

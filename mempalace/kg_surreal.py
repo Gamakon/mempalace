@@ -298,6 +298,273 @@ class KnowledgeGraphSurreal:
             raise RuntimeError(f"RELATE returned no record for {subject}->{pred}->{obj}")
         return str(created[0]["id"])
 
+    def add_triples_batch(self, triples: list[dict[str, Any]]) -> list[str]:
+        """Add a batch of triples in a minimal number of network round-trips.
+
+        Semantically identical to calling :meth:`add_triple` for each
+        dict in ``triples`` — same dedup rule, same provenance handling,
+        same return contract — but collapses the work into three queries
+        per batch:
+
+        1. One multi-statement ``UPSERT`` that ensures every referenced
+           entity exists (de-duplicated by slug across the batch).
+        2. One ``SELECT`` that pre-fetches the subset of the batch's
+           ``(sub, pred, obj[, valid_from, valid_to])`` keys already
+           present in the graph, so we skip writes that would otherwise
+           be deduped by :meth:`add_triple`.
+        3. One multi-statement ``RELATE`` that writes every non-duplicate
+           triple. Surreal returns each statement's result separately, so
+           we can hand back a list of triple record ids aligned to the
+           input order (duplicates get the existing id just like the
+           single-triple path).
+
+        This is the scaling fix for mp-ayu: per-triple RTT dominates a
+        10k+-triple migration, and three round-trips per batch — instead
+        of ``N × 3+`` — is what unlocks it.
+
+        Parameters
+        ----------
+        triples:
+            List of triple dicts. Each dict supports the same keys as
+            :meth:`add_triple`'s parameters:
+            ``subject``, ``predicate``, ``obj``, ``valid_from``,
+            ``valid_to``, ``confidence``, ``source_closet``,
+            ``source_file``, ``source_drawer_id``, ``adapter_name``,
+            ``extracted_at``. Missing optional keys default to the same
+            values :meth:`add_triple` uses.
+
+        Returns
+        -------
+        list[str]
+            One id per input triple, in order. Dedup hits return the
+            existing triple's id (matching :meth:`add_triple`).
+
+        Notes
+        -----
+        * **Idempotent.** Calling twice with the same batch produces the
+          same final graph state — the pre-check ensures no duplicate
+          open triples and no duplicate closed triples.
+        * **All-or-nothing writes.** A batch-level failure propagates
+          the ``RuntimeError`` from SurrealDB; caller retries the whole
+          batch. UPSERT + the dedup pre-check make retries safe.
+        * **Intra-batch dedup.** If the same ``(sub, pred, obj)`` appears
+          multiple times with ``valid_to is None`` inside one batch, only
+          the first is written; subsequent entries share the same id.
+          This mirrors how per-triple calls would behave if the first
+          one landed before the second ran.
+        """
+        if not triples:
+            return []
+
+        # ── Stage 1: resolve slugs + normalise fields up front ────────
+        # Each item becomes a dict with the Surreal-native types (record
+        # ids, normalised predicate) so the later stages can focus on
+        # SurrealQL assembly without re-doing the per-item work.
+        prepared: list[dict[str, Any]] = []
+        entities: dict[str, str] = {}  # slug -> display name (first wins)
+        for t in triples:
+            subject = t["subject"]
+            obj = t["obj"]
+            pred = self._normalize_predicate(t["predicate"])
+            sub_rec = self._entity_record(subject)
+            obj_rec = self._entity_record(obj)
+            # First display name for a given slug wins — the single-triple
+            # path is "last write wins" via UPSERT, but in a batch we do
+            # want determinism, and first-wins matches the typical mining
+            # order (entities are created before triples, so the name on
+            # the first triple matches the entity row already in place).
+            entities.setdefault(sub_rec.id, subject)
+            entities.setdefault(obj_rec.id, obj)
+            prepared.append(
+                {
+                    "subject": subject,
+                    "obj": obj,
+                    "pred": pred,
+                    "sub_rec": sub_rec,
+                    "obj_rec": obj_rec,
+                    "valid_from": t.get("valid_from"),
+                    "valid_to": t.get("valid_to"),
+                    "confidence": t.get("confidence", 1.0),
+                    "source_closet": t.get("source_closet"),
+                    "source_file": t.get("source_file"),
+                    "source_drawer_id": t.get("source_drawer_id"),
+                    "adapter_name": t.get("adapter_name"),
+                    "extracted_at": t.get("extracted_at"),
+                }
+            )
+
+        # ── Stage 2: ensure all referenced entities in one query ──────
+        # One UPSERT statement per unique slug, concatenated with ``;``.
+        # SurrealDB's wire protocol executes every statement in order.
+        # We use ``query_raw`` to avoid any surprise about which
+        # statement's result the sync helper returns — we don't need the
+        # results anyway, we just need the side effect.
+        ent_parts: list[str] = []
+        ent_params: dict[str, Any] = {}
+        for i, (slug, name) in enumerate(entities.items()):
+            ent_parts.append(f"UPSERT $rec_{i} SET name = $name_{i}")
+            ent_params[f"rec_{i}"] = RecordID("entity", slug)
+            ent_params[f"name_{i}"] = name
+        self._db.query_raw("; ".join(ent_parts) + ";", ent_params)
+
+        # ── Stage 3: pre-fetch existing triples that would dedup ──────
+        # Two scoped SELECTs (one for the open half, one for the closed
+        # half) bounded to the entity/predicate sets we actually touch,
+        # so the DB never scans the full ``triple`` table.
+        sub_recs_all = list({p["sub_rec"].id: p["sub_rec"] for p in prepared}.values())
+        obj_recs_all = list({p["obj_rec"].id: p["obj_rec"] for p in prepared}.values())
+        preds_all = list({p["pred"] for p in prepared})
+
+        open_keys: dict[tuple[str, str, str], str] = {}
+        closed_keys: dict[tuple[str, str, str, Optional[str], Optional[str]], str] = {}
+
+        has_open = any(p["valid_to"] is None for p in prepared)
+        has_closed = any(p["valid_to"] is not None for p in prepared)
+
+        if has_open:
+            rows = self._db.query(
+                (
+                    "SELECT id, in AS s, out AS o, predicate AS p "
+                    "FROM triple WHERE valid_to IS NONE "
+                    "AND in IN $subs AND out IN $objs AND predicate IN $preds"
+                ),
+                {"subs": sub_recs_all, "objs": obj_recs_all, "preds": preds_all},
+            ) or []
+            for r in rows:
+                key = (r["s"].id, r["p"], r["o"].id)
+                # Keep the first id seen; the open dedup key is unique by
+                # definition (SQLite enforces it, and the Surreal path
+                # enforces it via this very batch check).
+                open_keys.setdefault(key, str(r["id"]))
+
+        if has_closed:
+            rows = self._db.query(
+                (
+                    "SELECT id, in AS s, out AS o, predicate AS p, "
+                    "valid_from AS vf, valid_to AS vt "
+                    "FROM triple WHERE valid_to IS NOT NONE "
+                    "AND in IN $subs AND out IN $objs AND predicate IN $preds"
+                ),
+                {"subs": sub_recs_all, "objs": obj_recs_all, "preds": preds_all},
+            ) or []
+            for r in rows:
+                key = (
+                    r["s"].id,
+                    r["p"],
+                    r["o"].id,
+                    r.get("vf"),
+                    r.get("vt"),
+                )
+                closed_keys.setdefault(key, str(r["id"]))
+
+        # ── Stage 4: build the RELATE batch, skipping dedup hits ──────
+        # ``ids`` is the output aligned to the input order. We fill it
+        # as we go: dedup hits get the pre-fetched id immediately, new
+        # writes leave a placeholder that's filled after the RELATE
+        # query returns.
+        ids: list[Optional[str]] = [None] * len(prepared)
+        relate_parts: list[str] = []
+        relate_params: dict[str, Any] = {}
+        # Position of each RELATE statement -> index in ``ids`` to fill.
+        relate_slots: list[int] = []
+        # Within this batch, collapse same-key open writes so they share
+        # one id (matches the per-call "first-wins, later calls dedup"
+        # behaviour of add_triple).
+        pending_open: dict[tuple[str, str, str], int] = {}
+
+        for i, p in enumerate(prepared):
+            sub_slug = p["sub_rec"].id
+            obj_slug = p["obj_rec"].id
+            pred = p["pred"]
+            if p["valid_to"] is None:
+                key = (sub_slug, pred, obj_slug)
+                # Existing in DB -> dedup.
+                if key in open_keys:
+                    ids[i] = open_keys[key]
+                    continue
+                # Earlier in this batch -> share slot.
+                if key in pending_open:
+                    # Mark as alias; filled after the write completes.
+                    ids[i] = f"__ALIAS__{pending_open[key]}"
+                    continue
+                pending_open[key] = i
+            else:
+                key_c = (sub_slug, pred, obj_slug, p["valid_from"], p["valid_to"])
+                if key_c in closed_keys:
+                    ids[i] = closed_keys[key_c]
+                    continue
+
+            # Build the RELATE statement for this triple.
+            n = len(relate_slots)
+            relate_slots.append(i)
+            if p["extracted_at"] is None:
+                extracted_clause = "extracted_at = time::now()"
+            else:
+                extracted_clause = f"extracted_at = <datetime> $extracted_at_{n}"
+                relate_params[f"extracted_at_{n}"] = p["extracted_at"]
+            relate_parts.append(
+                f"RELATE $sub_{n}->triple->$obj_{n} SET "
+                f"predicate = $pred_{n}, "
+                f"valid_from = $valid_from_{n}, "
+                f"valid_to = $valid_to_{n}, "
+                f"confidence = $confidence_{n}, "
+                f"source_closet = $source_closet_{n}, "
+                f"source_file = $source_file_{n}, "
+                f"source_drawer_id = $source_drawer_id_{n}, "
+                f"adapter_name = $adapter_name_{n}, "
+                f"{extracted_clause}"
+            )
+            relate_params[f"sub_{n}"] = p["sub_rec"]
+            relate_params[f"obj_{n}"] = p["obj_rec"]
+            relate_params[f"pred_{n}"] = pred
+            relate_params[f"valid_from_{n}"] = p["valid_from"]
+            relate_params[f"valid_to_{n}"] = p["valid_to"]
+            relate_params[f"confidence_{n}"] = p["confidence"]
+            relate_params[f"source_closet_{n}"] = p["source_closet"]
+            relate_params[f"source_file_{n}"] = p["source_file"]
+            relate_params[f"source_drawer_id_{n}"] = p["source_drawer_id"]
+            relate_params[f"adapter_name_{n}"] = p["adapter_name"]
+
+        # ── Stage 5: execute the RELATE batch (if anything to write) ──
+        if relate_parts:
+            raw = self._db.query_raw("; ".join(relate_parts) + ";", relate_params)
+            stmts = raw.get("result", []) if isinstance(raw, dict) else []
+            if len(stmts) != len(relate_parts):
+                raise RuntimeError(
+                    f"RELATE batch returned {len(stmts)} statement results, "
+                    f"expected {len(relate_parts)}"
+                )
+            for pos, stmt in enumerate(stmts):
+                status = stmt.get("status")
+                if status != "OK":
+                    # A single bad statement poisons the batch — raise so
+                    # the caller can retry (UPSERT + dedup pre-check make
+                    # the retry idempotent).
+                    raise RuntimeError(
+                        f"RELATE statement {pos} failed: {stmt.get('result')!r}"
+                    )
+                rows = stmt.get("result") or []
+                if not rows:
+                    raise RuntimeError(
+                        f"RELATE statement {pos} returned no record "
+                        f"(triple index {relate_slots[pos]})"
+                    )
+                ids[relate_slots[pos]] = str(rows[0]["id"])
+
+        # ── Stage 6: resolve intra-batch alias slots ─────────────────
+        for i, v in enumerate(ids):
+            if isinstance(v, str) and v.startswith("__ALIAS__"):
+                src = int(v[len("__ALIAS__") :])
+                ids[i] = ids[src]
+
+        # Every slot must be filled.
+        out: list[str] = []
+        for i, v in enumerate(ids):
+            if v is None:
+                raise RuntimeError(f"add_triples_batch: triple at index {i} got no id")
+            out.append(v)
+        return out
+
     def invalidate(
         self,
         subject: str,

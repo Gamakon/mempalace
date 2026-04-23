@@ -4,10 +4,20 @@ import tempfile
 from pathlib import Path
 
 import chromadb
+import pytest
 import yaml
 
 from mempalace.miner import load_config, mine, scan_project, status
 from mempalace.palace import NORMALIZE_VERSION, file_already_mined
+
+# These tests instantiate ``chromadb.PersistentClient`` directly to inspect
+# the palace — they are inherently Chroma-specific. Skip when the product
+# is forced to use a non-Chroma backend; a Surreal-backed palace has no
+# on-disk Chroma SQLite for these assertions to read.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("MEMPALACE_BACKEND", "chroma") != "chroma",
+    reason="Chroma-only tests: they poke PersistentClient directly",
+)
 
 
 def write_file(path: Path, content: str):

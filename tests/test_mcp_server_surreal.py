@@ -60,11 +60,12 @@ def surreal_mcp(monkeypatch, tmp_path):
     from mempalace import mcp_server, palace_graph
     from mempalace.backends.surreal import SurrealBackend
     from mempalace.kg_surreal import KnowledgeGraphSurreal
+    from mempalace.palace import palace_ref_for
 
     run_id = uuid.uuid4().hex[:10]
     ns_drawer = f"mp_mcp_{run_id}"
     db_kg = f"mp_mcp_kg_{run_id}"
-    palace_id = f"palace_{run_id}"
+    palace_path = f"/tmp/surreal_palace_{run_id}"
 
     # Fake config whose public surface matches MempalaceConfig for the
     # fields mcp_server actually reads. ``collection_name`` matches the
@@ -72,10 +73,17 @@ def surreal_mcp(monkeypatch, tmp_path):
     # the ``drawer`` table.
     class _SurrealCfg:
         backend = "surreal"
-        palace_path = f"/tmp/surreal_palace_{run_id}"  # unused by surreal backend
         collection_name = "mempalace_drawers"
 
-    monkeypatch.setattr(mcp_server, "_config", _SurrealCfg())
+    cfg = _SurrealCfg()
+    cfg.palace_path = palace_path
+    monkeypatch.setattr(mcp_server, "_config", cfg)
+    # ``palace._active_backend()`` constructs a fresh ``MempalaceConfig()``
+    # on each call and reads ``.backend`` from there — monkeypatching
+    # ``mcp_server._config`` alone is not enough to route
+    # ``searcher.search_memories`` through Surreal. Force the env var so
+    # any fresh ``MempalaceConfig`` resolves to the surreal backend.
+    monkeypatch.setenv("MEMPALACE_BACKEND", "surreal")
 
     kg = KnowledgeGraphSurreal(namespace="test", database=db_kg)
     # Wipe any leftover state from prior runs in this DB — test isolation.
@@ -87,9 +95,13 @@ def surreal_mcp(monkeypatch, tmp_path):
     # Swap in a fresh Surreal backend targeting a unique namespace so
     # drawer tables don't collide with other tests.
     backend = SurrealBackend(namespace=ns_drawer)
-    from mempalace.backends.base import PalaceRef
 
-    palace_ref = PalaceRef(id=palace_id, local_path=None)
+    # Derive the palace ref from ``palace_path`` using the same helper
+    # ``palace.get_collection`` and ``mcp_server._get_surreal_backend``
+    # use (mp-0ii) so the MCP write path and the searcher read path
+    # address the same Surreal DB. Using an ad-hoc ``palace_id`` here
+    # would split drawer writes from search reads.
+    palace_ref = palace_ref_for(palace_path)
 
     # Reset caches so the module actually uses our patched objects.
     monkeypatch.setattr(mcp_server, "_collection_cache", None)
@@ -97,6 +109,18 @@ def surreal_mcp(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_server, "_metadata_cache_time", 0)
     monkeypatch.setattr(mcp_server, "_surreal_backend", backend)
     monkeypatch.setattr(mcp_server, "_surreal_palace_ref", palace_ref)
+    # Also patch the path tracker — otherwise a different path set by an
+    # earlier test triggers _get_surreal_backend to rebuild the ref and
+    # discard the fixture's per-test isolation.
+    monkeypatch.setattr(mcp_server, "_surreal_palace_ref_path", palace_path)
+
+    # Mirror the backend into the shared registry (mp-0ii) so
+    # ``searcher.search_memories`` — which resolves the backend via
+    # ``palace.get_collection`` → registry — lands on the SAME
+    # namespace-isolated instance the MCP tool handlers write to.
+    from mempalace.backends import register_instance
+
+    register_instance("surreal", backend)
 
     # Redirect the on-disk tunnel store so tunnel tool tests never
     # touch the real ``~/.mempalace/tunnels.json`` — and start empty.
@@ -108,6 +132,17 @@ def surreal_mcp(monkeypatch, tmp_path):
     palace_graph.invalidate_graph_cache()
 
     yield mcp_server
+
+    # Drop the per-test backend instance from the shared registry so the
+    # next test gets a fresh default instance (mp-0ii).
+    try:
+        from mempalace.backends.registry import _instances, _lock
+
+        with _lock:
+            if _instances.get("surreal") is backend:
+                _instances.pop("surreal", None)
+    except Exception:
+        pass
 
     # Tear down both the drawer namespace and the KG tables so reruns start
     # clean and nothing leaks server-side.
@@ -181,7 +216,7 @@ class TestSurrealDrawerSearch:
         # Search by a topic the drawer covers — vector search should return it.
         result = surreal_mcp.tool_search(query="jwt authentication tokens", limit=5)
         assert "error" not in result, result
-        hit_ids_or_texts = [h.get("text", "") for h in result.get("hits", [])]
+        hit_ids_or_texts = [h.get("text", "") for h in result.get("results", [])]
         assert any("JWT" in t or "jwt" in t.lower() for t in hit_ids_or_texts), result
         assert drawer_id.startswith("drawer_project_backend_")
 
@@ -194,8 +229,8 @@ class TestSurrealDrawerSearch:
         # is acceptable — what we MUST NOT see is a Python traceback /
         # an unexpected error surface.
         assert "error" not in result or result["error"] == "No palace found"
-        if "hits" in result:
-            assert result["hits"] == []
+        if "results" in result:
+            assert result["results"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -659,3 +694,179 @@ class TestSurrealHookAndSettingsTools:
         r = surreal_mcp.tool_reconnect()
         assert r["success"] is True, r
         assert r["drawers"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# tool_search return-shape parity (mp-1ou)
+# ---------------------------------------------------------------------------
+
+
+class TestSearchShapeParity:
+    """Prove ``tool_search`` returns an identically-shaped dict regardless
+    of backend. Values (distances, similarity) may drift — they come from
+    different embedders — but keys and types MUST match. This is the
+    guardrail that keeps MCP clients interchangeable across backends."""
+
+    def _canonical_shape(self, result: dict) -> dict:
+        """Return a structural fingerprint of ``result``: keys + value types
+        at the top level and per-hit level. Numeric values are collapsed to
+        their type so legitimate cross-backend drift doesn't fail parity."""
+
+        def _typename(v):
+            if v is None:
+                return "NoneType"
+            return type(v).__name__
+
+        top = {k: _typename(v) for k, v in result.items()}
+        per_hit = []
+        for h in result.get("results", []):
+            per_hit.append({k: _typename(v) for k, v in h.items()})
+        return {"top": top, "hits": per_hit}
+
+    def test_tool_search_shape_matches_across_backends(
+        self, surreal_mcp, tmp_path, monkeypatch
+    ):
+        import os as _os
+
+        from mempalace import mcp_server
+        from mempalace.config import MempalaceConfig
+
+        # Force the active backend to surreal for the Surreal half so
+        # ``palace.get_collection`` (consulted by
+        # ``searcher.search_memories``) resolves to the SurrealBackend
+        # the ``surreal_mcp`` fixture already wired up. Without this, a
+        # bare ``pytest`` invocation leaves MEMPALACE_BACKEND unset and
+        # the Chroma fallback tries to read the fixture's scratch path
+        # (which is never a real Chroma palace).
+        monkeypatch.setenv("MEMPALACE_BACKEND", "surreal")
+
+        # --- Seed the Surreal backend ---
+        add = surreal_mcp.tool_add_drawer(
+            wing="project",
+            room="backend",
+            content=(
+                "The authentication module uses JWT tokens for session "
+                "management. Tokens expire after 24 hours."
+            ),
+        )
+        assert add["success"] is True, add
+
+        surreal_result = surreal_mcp.tool_search(
+            query="jwt authentication tokens", limit=3
+        )
+        assert "error" not in surreal_result, surreal_result
+        assert "results" in surreal_result, (
+            "Surreal path must emit canonical 'results' key (mp-1ou)"
+        )
+
+        # --- Seed an independent Chroma palace + swap the MCP config onto it ---
+        chroma_palace = tmp_path / "chroma_palace"
+        chroma_palace.mkdir()
+
+        cfg_dir = tmp_path / "cfg"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.json").write_text(
+            '{"palace_path": "' + str(chroma_palace) + '", "backend": "chroma"}'
+        )
+        # Force chroma regardless of MEMPALACE_BACKEND env var.
+        monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
+        chroma_cfg = MempalaceConfig(config_dir=str(cfg_dir))
+        assert chroma_cfg.backend == "chroma"
+
+        # Minimally seed the Chroma palace with equivalent content.
+        import chromadb
+
+        client = chromadb.PersistentClient(path=str(chroma_palace))
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["drawer_project_backend_aaa"],
+            documents=[
+                "The authentication module uses JWT tokens for session "
+                "management. Tokens expire after 24 hours."
+            ],
+            metadatas=[
+                {
+                    "wing": "project",
+                    "room": "backend",
+                    "source_file": "auth.py",
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-01-01T00:00:00",
+                }
+            ],
+        )
+
+        monkeypatch.setattr(mcp_server, "_config", chroma_cfg)
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+        monkeypatch.setattr(mcp_server, "_metadata_cache_time", 0)
+
+        chroma_result = mcp_server.tool_search(
+            query="jwt authentication tokens", limit=3
+        )
+        assert "error" not in chroma_result, chroma_result
+        assert "results" in chroma_result
+
+        # --- Compare structural fingerprints ---
+        surreal_shape = self._canonical_shape(surreal_result)
+        chroma_shape = self._canonical_shape(chroma_result)
+
+        assert set(surreal_shape["top"].keys()) == set(chroma_shape["top"].keys()), (
+            f"Top-level keys diverge. surreal={sorted(surreal_shape['top'])} "
+            f"chroma={sorted(chroma_shape['top'])}"
+        )
+        # Both emit a non-empty hit list; compare the per-hit schema of the
+        # first hit on each side. (Chroma can add optional keys like
+        # `closet_preview` / `drawer_index` on boosted hits — for the basic
+        # single-drawer seed above those aren't triggered, so the common
+        # set must match.)
+        assert surreal_shape["hits"], "Surreal search returned no hits"
+        assert chroma_shape["hits"], "Chroma search returned no hits"
+
+        common_keys = set(surreal_shape["hits"][0]) & set(chroma_shape["hits"][0])
+        required = {
+            "text",
+            "wing",
+            "room",
+            "source_file",
+            "created_at",
+            "similarity",
+            "distance",
+            "effective_distance",
+            "closet_boost",
+            "matched_via",
+        }
+        missing_surreal = required - set(surreal_shape["hits"][0])
+        missing_chroma = required - set(chroma_shape["hits"][0])
+        assert not missing_surreal, (
+            f"Surreal hit missing canonical fields: {missing_surreal}"
+        )
+        assert not missing_chroma, (
+            f"Chroma hit missing canonical fields: {missing_chroma}"
+        )
+
+        # Types of the shared fields must match exactly.
+        for k in required & common_keys:
+            assert surreal_shape["hits"][0][k] == chroma_shape["hits"][0][k], (
+                f"Field '{k}' type mismatch: surreal="
+                f"{surreal_shape['hits'][0][k]} chroma={chroma_shape['hits'][0][k]}"
+            )
+
+        # Neither path may emit the legacy 'hits' key — one canonical key only.
+        assert "hits" not in surreal_result, (
+            "Surreal path must not emit legacy 'hits' key"
+        )
+        assert "hits" not in chroma_result, (
+            "Chroma path must not emit legacy 'hits' key"
+        )
+
+        # Cleanup: drop the Chroma collection we built for this test so it
+        # doesn't leak into the persistent client on disk.
+        try:
+            client.delete_collection("mempalace_drawers")
+        except Exception:
+            pass
+        del client
+        _os.sync() if hasattr(_os, "sync") else None

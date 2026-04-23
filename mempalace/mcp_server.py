@@ -151,9 +151,16 @@ def _get_surreal_backend():
     that two palaces with distinct paths never share a Surreal database —
     required for test isolation and for the CLI's ``mempalace use`` flow
     (mp-1y1).
+
+    The backend instance is also installed into the shared
+    :mod:`mempalace.backends.registry` so that in-tree consumers —
+    ``searcher.search_memories`` via ``palace.get_collection`` — resolve
+    the same long-lived connection rather than spinning up a parallel
+    one that might point at a different namespace (mp-0ii).
     """
     global _surreal_backend, _surreal_palace_ref, _surreal_palace_ref_path
     if _surreal_backend is None:
+        from .backends import register_instance
         from .backends.surreal import SurrealBackend
 
         _surreal_backend = SurrealBackend(
@@ -161,6 +168,7 @@ def _get_surreal_backend():
             username=os.environ.get("MEMPALACE_SURREAL_USER", "root"),
             password=os.environ.get("MEMPALACE_SURREAL_PASS", "root"),
         )
+        register_instance("surreal", _surreal_backend)
     current_path = _config.palace_path
     if _surreal_palace_ref is None or _surreal_palace_ref_path != current_path:
         palace_id = "mcp_" + hashlib.sha256(current_path.encode()).hexdigest()[:16]
@@ -577,79 +585,6 @@ def tool_get_taxonomy():
     return result
 
 
-def _search_surreal(clean_query: str, wing, room, n_results, max_distance):
-    """Minimal direct-collection search path for the Surreal backend.
-
-    ``searcher.search_memories`` is tightly coupled to the Chroma palace
-    (filesystem path, drawer+closet hybrid). For Surreal we bypass the
-    closet hybrid and rank on raw vector distances straight from the
-    collection — the SurrealCollection already embeds texts the same way
-    Chroma does, so the returned distances are directly comparable.
-    The return shape mirrors ``search_memories`` so MCP callers see the
-    same JSON keys regardless of backend.
-    """
-    from pathlib import Path
-
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-
-    where = None
-    conditions = []
-    if wing:
-        conditions.append({"wing": wing})
-    if room:
-        conditions.append({"room": room})
-    if len(conditions) == 1:
-        where = conditions[0]
-    elif len(conditions) > 1:
-        where = {"$and": conditions}
-
-    try:
-        kwargs = {
-            "query_texts": [clean_query],
-            "n_results": max(1, n_results),
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-        results = col.query(**kwargs)
-    except Exception as e:
-        return {"error": f"Search error: {e}"}
-
-    hits = []
-    ids_outer = results.ids or [[]]
-    docs_outer = results.documents or [[]]
-    metas_outer = results.metadatas or [[]]
-    dists_outer = results.distances or [[]]
-    if ids_outer and ids_outer[0]:
-        for doc, meta, dist in zip(docs_outer[0], metas_outer[0], dists_outer[0]):
-            if max_distance > 0.0 and dist > max_distance:
-                continue
-            meta = meta or {}
-            source = meta.get("source_file", "") or ""
-            hits.append(
-                {
-                    "text": doc,
-                    "wing": meta.get("wing", "unknown"),
-                    "room": meta.get("room", "unknown"),
-                    "source_file": Path(source).name if source else "?",
-                    "created_at": meta.get("filed_at", "unknown"),
-                    "similarity": round(max(0.0, 1 - dist), 3),
-                    "distance": round(dist, 4),
-                    "effective_distance": round(dist, 4),
-                    "closet_boost": 0.0,
-                    "matched_via": "drawer",
-                }
-            )
-
-    return {
-        "query": clean_query,
-        "count": len(hits),
-        "hits": hits,
-    }
-
-
 def tool_search(
     query: str,
     limit: int = 5,
@@ -659,35 +594,39 @@ def tool_search(
     min_similarity: float = None,
     context: str = None,
 ):
+    """Semantic search across the palace (backend-agnostic; mp-0ii).
+
+    Both Chroma and Surreal palaces route through
+    :func:`mempalace.searcher.search_memories` — the searcher resolves
+    the active backend via :func:`mempalace.palace.get_collection`, so
+    there is exactly one drawer+closet hybrid code path regardless of
+    ``MEMPALACE_BACKEND``.
+    """
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
-    # Backwards compat: accept old name
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
-    if _config.backend == "surreal":
-        result = _search_surreal(
-            sanitized["clean_query"],
-            wing=wing,
-            room=room,
-            n_results=limit,
-            max_distance=dist,
-        )
-    else:
-        result = search_memories(
-            sanitized["clean_query"],
-            palace_path=_config.palace_path,
-            wing=wing,
-            room=room,
-            n_results=limit,
-            max_distance=dist,
-        )
+    result = search_memories(
+        sanitized["clean_query"],
+        palace_path=_config.palace_path,
+        wing=wing,
+        room=room,
+        n_results=limit,
+        max_distance=dist,
+    )
+    # Expose a top-level ``count`` alongside ``results`` — legacy callers
+    # mid-migration (mp-1ou) may check either. ``search_memories`` itself
+    # returns the richer {query, filters, total_before_filter, results}
+    # shape; we just decorate.
+    if isinstance(result, dict) and "results" in result:
+        result["count"] = len(result["results"])
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:
         result["query_sanitized"] = True

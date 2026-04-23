@@ -9,6 +9,7 @@ import hashlib
 import os
 import re
 
+from .backends import PalaceRef, get_backend
 from .backends.chroma import ChromaBackend
 
 SKIP_DIRS = {
@@ -37,6 +38,10 @@ SKIP_DIRS = {
     "target",
 }
 
+# Retained for legacy direct-access callers (tests / scripts) that import
+# ``ChromaBackend`` via :mod:`mempalace.palace`. New code should route through
+# :func:`get_collection` below, which resolves the active backend per
+# ``MempalaceConfig().backend``.
 _DEFAULT_BACKEND = ChromaBackend()
 
 # Schema version for drawer normalization. Bump when the normalization
@@ -50,14 +55,48 @@ _DEFAULT_BACKEND = ChromaBackend()
 NORMALIZE_VERSION = 2
 
 
+def palace_ref_for(palace_path: str) -> PalaceRef:
+    """Derive a stable :class:`PalaceRef` for ``palace_path``.
+
+    Both backends consume a ``PalaceRef``; the derivation must be
+    deterministic so two processes (e.g. the MCP server and a CLI
+    invocation of ``mempalace search``) land on the same Surreal database
+    for the same on-disk palace path. The ``id`` must exactly match
+    ``mcp_server._get_surreal_backend``'s derivation — any drift would
+    split a palace's drawer writes across two databases.
+    """
+    palace_id = "mcp_" + hashlib.sha256(palace_path.encode()).hexdigest()[:16]
+    return PalaceRef(id=palace_id, local_path=palace_path)
+
+
+def _active_backend():
+    """Return the backend instance for the currently-configured backend name.
+
+    Reads ``MempalaceConfig().backend`` on each call so that test fixtures
+    that monkeypatch ``MEMPALACE_BACKEND`` mid-session take effect without
+    a module reload.
+    """
+    from .config import MempalaceConfig
+
+    return get_backend(MempalaceConfig().backend)
+
+
 def get_collection(
     palace_path: str,
     collection_name: str = "mempalace_drawers",
     create: bool = True,
 ):
-    """Get the palace collection through the backend layer."""
-    return _DEFAULT_BACKEND.get_collection(
-        palace_path,
+    """Get a palace collection through the configured backend (mp-0ii).
+
+    Dispatches via the backend registry so ``MEMPALACE_BACKEND=surreal``
+    routes both drawer and closet reads through SurrealDB rather than
+    Chroma. The ``palace_path`` argument is the on-disk directory for
+    Chroma and the key SurrealDB derives a per-palace database name
+    from; it is always required.
+    """
+    backend = _active_backend()
+    return backend.get_collection(
+        palace=palace_ref_for(palace_path),
         collection_name=collection_name,
         create=create,
     )
