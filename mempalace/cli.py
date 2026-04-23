@@ -261,7 +261,7 @@ def cmd_migrate_to_surreal(args):
     payload (verbatim text + embeddings + metadata). Both are idempotent;
     running either twice lands the same final state in Surreal.
     """
-    from .migrate import migrate_to_surreal
+    from .migrate import TargetCollisionError, migrate_to_surreal
 
     source = (
         os.path.expanduser(args.source)
@@ -275,10 +275,17 @@ def cmd_migrate_to_surreal(args):
             target_db=args.target_db,
             dry_run=args.dry_run,
             batch_size=args.batch_size,
+            allow_merge=getattr(args, "allow_merge", False),
         )
     except FileNotFoundError as e:
         print(f"\n  {e}", file=sys.stderr)
         sys.exit(1)
+    except TargetCollisionError as e:
+        # mp-2v9: refuse-to-merge is its own distinct exit code so CI can
+        # detect "you asked to write into a palace that already exists"
+        # separately from a generic migration failure.
+        print(f"\n  {e}", file=sys.stderr)
+        sys.exit(5)
     except Exception as e:
         # migrate_to_surreal already printed where it stopped via progress
         # output; surface the exception and exit non-zero so CI / scripts
@@ -903,7 +910,24 @@ def main():
     p_migrate_surreal.add_argument(
         "--target-db",
         default=None,
-        help="SurrealDB database name (default: derived from palace path)",
+        help=(
+            "SurrealDB database name. Defaults to "
+            "'<palace-basename>_<sha256[:8]-of-abspath>' so two palaces with "
+            "the same basename at different paths get distinct target DBs. "
+            "If you pass this explicitly and the target already has drawers, "
+            "the migration refuses to run unless --allow-merge is also set."
+        ),
+    )
+    p_migrate_surreal.add_argument(
+        "--allow-merge",
+        action="store_true",
+        help=(
+            "Opt in to upserting into a non-empty --target-db (mp-2v9). "
+            "Default behaviour: refuse, to prevent silent merges of two "
+            "different palaces into one Surreal DB. Ignored when --target-db "
+            "is not set (default-derived names include a path-hash slug, "
+            "so a collision would have to be intentional)."
+        ),
     )
     p_migrate_surreal.add_argument(
         "--dry-run",

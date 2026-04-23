@@ -17,6 +17,7 @@ import pytest
 
 from mempalace.backends.chroma import ChromaBackend
 from mempalace.migrate import (
+    TargetCollisionError,
     _derive_surreal_db_name,
     migrate_to_surreal,
 )
@@ -370,3 +371,84 @@ def test_missing_source_palace_raises(tmp_path, surreal_target):
             target_ns=surreal_target,
             progress=False,
         )
+
+
+# ---------------------------------------------------------------------------
+# mp-2v9: collision guard against --target-db that already has drawers.
+# ---------------------------------------------------------------------------
+
+
+def test_target_db_populated_refuses_without_allow_merge(chroma_palace, surreal_target):
+    """Explicit --target-db + already-populated target -> refuse.
+
+    Round-trip through the real Surreal server: first migration fills
+    ``shared_target``, second migration (with explicit --target-db
+    pointing at the same name) must raise TargetCollisionError.
+    """
+    shared_db = f"collide_{uuid.uuid4().hex[:6]}"
+
+    # First migration: target is empty, proceeds normally.
+    r1 = migrate_to_surreal(
+        source_palace=chroma_palace["path"],
+        target_ns=surreal_target,
+        target_db=shared_db,
+        progress=False,
+    )
+    assert r1["migrated"] == 23
+
+    # Second migration: same NS/DB but pretend it's a different source
+    # palace — copy it to a new directory with a different basename so
+    # the default derivation would NOT collide. The explicit --target-db
+    # drives the collision.
+    import shutil
+
+    second_path = chroma_palace["path"] + "_clone"
+    shutil.copytree(chroma_palace["path"], second_path)
+
+    with pytest.raises(TargetCollisionError):
+        migrate_to_surreal(
+            source_palace=second_path,
+            target_ns=surreal_target,
+            target_db=shared_db,
+            progress=False,
+        )
+
+
+def test_target_db_populated_proceeds_with_allow_merge(chroma_palace, surreal_target):
+    """--allow-merge lets a caller upsert into an existing Surreal DB.
+
+    This is the escape hatch for deliberate merges (e.g. rebuilding an
+    index while keeping old drawers around). The second migration's
+    idempotent upsert means counts stay at 23 after it completes.
+    """
+    shared_db = f"merge_{uuid.uuid4().hex[:6]}"
+    r1 = migrate_to_surreal(
+        source_palace=chroma_palace["path"],
+        target_ns=surreal_target,
+        target_db=shared_db,
+        progress=False,
+    )
+    assert r1["migrated"] == 23
+
+    r2 = migrate_to_surreal(
+        source_palace=chroma_palace["path"],
+        target_ns=surreal_target,
+        target_db=shared_db,
+        allow_merge=True,
+        progress=False,
+    )
+    assert r2["migrated"] == 23
+    assert r2["verified"] is True
+
+
+def test_target_db_fresh_proceeds_silently(chroma_palace, surreal_target):
+    """Explicit --target-db pointing at an empty NS/DB proceeds cleanly."""
+    fresh_db = f"fresh_{uuid.uuid4().hex[:6]}"
+    result = migrate_to_surreal(
+        source_palace=chroma_palace["path"],
+        target_ns=surreal_target,
+        target_db=fresh_db,
+        progress=False,
+    )
+    assert result["migrated"] == 23
+    assert result["verified"] is True

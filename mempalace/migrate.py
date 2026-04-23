@@ -263,18 +263,33 @@ _DB_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_]+")
 
 
 def _derive_surreal_db_name(palace_path: str) -> str:
-    """Derive a stable Surreal DB name from a palace path.
+    """Derive a collision-resistant Surreal DB name from a palace path.
 
     Surreal ``USE DB`` identifiers are restricted to ``[A-Za-z0-9_]``. We
-    sanitize the palace directory basename; if the cleaned basename is
-    empty (e.g. ``/``) we fall back to a sha256-derived slug of the absolute
-    path so the name is still deterministic per palace.
+    want two properties from a default-derived name:
+
+    1. **Human-readable** — a glance at the Surreal DB list tells the
+       operator which palace it corresponds to. So we keep the palace
+       directory basename as a prefix.
+    2. **Collision-resistant** — two palaces at different paths but with
+       the same basename (e.g. ``/home/a/mem`` vs ``/home/b/mem``) must
+       NOT silently share a target DB. Upsert semantics would merge the
+       two sets of drawers with no warning. mp-2v9 fixes that by
+       appending an 8-char sha256 slug of the absolute path.
+
+    Layout: ``<cleaned-basename>_<sha8>`` where ``sha8`` is the first 8
+    hex chars of ``sha256(abspath(palace_path))``. If the cleaned
+    basename is empty (e.g. ``/``) we fall back to ``palace`` as the
+    prefix — the hash still disambiguates.
+
+    The full absolute path (not just the passed-in string) is hashed so
+    ``foo/../mem`` and ``mem`` resolve to the same DB.
     """
-    base = os.path.basename(os.path.normpath(palace_path)) or "palace"
-    cleaned = _DB_NAME_SAFE_RE.sub("_", base).strip("_")
-    if not cleaned:
-        cleaned = "palace_" + hashlib.sha256(palace_path.encode()).hexdigest()[:10]
-    return cleaned
+    abspath = os.path.abspath(os.path.expanduser(palace_path))
+    base = os.path.basename(os.path.normpath(abspath)) or "palace"
+    cleaned = _DB_NAME_SAFE_RE.sub("_", base).strip("_") or "palace"
+    path_hash = hashlib.sha256(abspath.encode()).hexdigest()[:8]
+    return f"{cleaned}_{path_hash}"
 
 
 # The ChromaDB miner/sweeper produces two collections per palace:
@@ -454,6 +469,77 @@ def _verify_migration(
     return (len(errors) == 0, errors)
 
 
+class TargetCollisionError(RuntimeError):
+    """Raised when the target Surreal DB already has drawers and the caller
+    did not pass ``allow_merge=True`` (CLI: ``--allow-merge``).
+
+    mp-2v9: merging two palaces into the same Surreal DB via upsert is a
+    silent data-corruption risk — two drawers that happen to share an id
+    (same chunk hash, same chunk_index in a different palace) would
+    collide and one would overwrite the other. Refusing by default is
+    the safe behaviour; the caller must opt-in explicitly.
+    """
+
+
+def _inspect_target_collision(
+    surreal_kwargs: dict,
+    db_name: str,
+    *,
+    sample_size: int = 3,
+) -> tuple[int, list[str], dict[str, int]]:
+    """Return ``(total_existing, sampled_ids, per_collection_counts)``.
+
+    Opens the target Surreal DB with ``create=False`` for each known
+    collection; a :class:`PalaceNotFoundError` (nothing there yet) is
+    treated as an empty target and returns ``(0, [], {})``. Any other
+    error is surfaced so the caller can fail loudly rather than silently
+    proceeding into an unknown state.
+
+    Deliberately side-effect-free: we never bootstrap or create anything
+    during the collision check, even if the DB is present but empty.
+    """
+    from .backends.base import PalaceNotFoundError, PalaceRef
+    from .backends.surreal import SurrealBackend
+
+    backend = SurrealBackend(**surreal_kwargs)
+    palace_ref = PalaceRef(id=db_name, local_path=None, namespace=db_name)
+    per_counts: dict[str, int] = {}
+    sampled_ids: list[str] = []
+    total = 0
+    try:
+        for src_name, _dst in _COLLECTION_MAP:
+            try:
+                col = backend.get_collection(
+                    palace=palace_ref,
+                    collection_name=src_name,
+                    create=False,
+                )
+            except PalaceNotFoundError:
+                # Palace doesn't exist at all — definitely empty.
+                return (0, [], {})
+            except Exception as e:
+                # Any other failure: a FileNotFoundError wrapper around a
+                # missing db, a transient surreal hiccup, etc. Treat as
+                # "not present" only when the error string clearly says
+                # so; otherwise re-raise so the caller sees the real bug.
+                msg = str(e).lower()
+                if "does not exist" in msg or "not found" in msg or "no such" in msg:
+                    return (0, [], {})
+                raise
+            cnt = col.count()
+            per_counts[src_name] = cnt
+            total += cnt
+            if cnt and len(sampled_ids) < sample_size:
+                page = col.get(limit=max(1, sample_size - len(sampled_ids)), include=[])
+                sampled_ids.extend(list(page.get("ids") or []))
+    finally:
+        try:
+            backend.close()
+        except Exception:
+            pass
+    return total, sampled_ids, per_counts
+
+
 def _resolve_surreal_connection(
     surreal_url: Optional[str],
     surreal_user: Optional[str],
@@ -582,6 +668,7 @@ def migrate_to_surreal(
     surreal_user: Optional[str] = None,
     surreal_pass: Optional[str] = None,
     progress: bool = True,
+    allow_merge: bool = False,
 ) -> dict:
     """Migrate drawers + embeddings from a Chroma palace into SurrealDB (mp-ciw).
 
@@ -598,6 +685,17 @@ def migrate_to_surreal(
     * KG triples and a first-class ``entity`` / ``triple`` port are
       out of scope — mp-3lc handles them.
 
+    mp-2v9 collision guard
+    ----------------------
+    When ``target_db`` is supplied explicitly and the target already
+    contains drawers (or closets), we refuse to migrate unless the
+    caller passes ``allow_merge=True``. This prevents silently merging
+    two palaces into the same Surreal DB via upsert — which would be
+    indistinguishable from data corruption if the two palaces happen to
+    share drawer ids. The default-derived target DB name includes an
+    8-char sha256 slug of the absolute source path, so two different
+    palaces with the same basename never collide by default.
+
     Returns a dict summary with ``{total, migrated, duration_s, verified,
     errors}`` suitable for programmatic callers (tests, future GUI).
     """
@@ -610,6 +708,7 @@ def migrate_to_surreal(
             f"source palace not found or has no chroma.sqlite3: {source_palace}"
         )
 
+    target_db_explicit = target_db is not None
     db_name = target_db or _derive_surreal_db_name(source_palace)
     namespace = target_ns or os.environ.get("MEMPALACE_SURREAL_NS", "mempalace")
 
@@ -659,6 +758,37 @@ def migrate_to_surreal(
         }
 
     surreal_kwargs = _resolve_surreal_connection(surreal_url, surreal_user, surreal_pass, namespace)
+
+    # mp-2v9 guardrail: if the caller supplied --target-db explicitly and
+    # the target already has data, refuse to merge without opt-in. We only
+    # trigger on the explicit-override path because the default derivation
+    # now embeds a sha8 of the absolute path, making accidental collisions
+    # astronomically unlikely. A user who typed out --target-db, however,
+    # may have picked a name that already belongs to another palace.
+    if target_db_explicit and not allow_merge:
+        existing_total, sampled_ids, per_counts = _inspect_target_collision(surreal_kwargs, db_name)
+        if existing_total > 0:
+            if progress:
+                print(
+                    f"\n  REFUSING to migrate: target DB {db_name!r} already contains "
+                    f"{existing_total} row(s) across: "
+                    f"{', '.join(f'{k}={v}' for k, v in per_counts.items()) or '(none)'}"
+                )
+                if sampled_ids:
+                    print(f"  Sampled existing ids: {sampled_ids[:3]}")
+                print(
+                    "  Pass --allow-merge to upsert into the existing DB on purpose,\n"
+                    "  or pick a different --target-db. Aborting.\n"
+                )
+            raise TargetCollisionError(
+                f"target Surreal DB {db_name!r} already has {existing_total} "
+                f"row(s) ({per_counts}); pass allow_merge=True to proceed"
+            )
+        if progress:
+            print(f"  Target DB {db_name!r} is empty — proceeding.")
+    elif target_db_explicit and allow_merge and progress:
+        print(f"  --allow-merge set: will upsert into existing DB {db_name!r} if present.")
+
     surreal_backend = SurrealBackend(**surreal_kwargs)
     palace_ref = PalaceRef(id=db_name, local_path=None, namespace=db_name)
 
