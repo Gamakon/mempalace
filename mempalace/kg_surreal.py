@@ -18,7 +18,10 @@ Scope (mp-4yf):
 
 Scope (mp-84n, this module):
     - ``timeline``             entity-filtered/global chronological scan
-    - ``invalidate``           set ``valid_to`` on an open triple by id
+    - ``invalidate``           close the open triple matching a
+                               ``(subject, predicate, object)`` — surface
+                               restored to SQLite parity in mp-s2k so the
+                               MCP server can call either backend uniformly
     - ``seed_from_entity_facts`` bootstrap from ``fact_checker.ENTITY_FACTS``
 
 Connection model:
@@ -39,11 +42,25 @@ Schema notes:
     and ``triple`` tables as SCHEMALESS here and store the date fields as
     strings. The schema-tightening pass is mp-6gu. This divergence is
     called out in the task report.
+
+Slug strategy (mp-1jb):
+    Entity slugs *exactly* match the SQLite KG's ``_entity_id`` — i.e.
+    ``name.lower().replace(" ", "_").replace("'", "")`` and nothing else.
+    ``"Dr. Chen"`` therefore becomes ``"dr._chen"`` in both backends, so a
+    palace migrated from SQLite to SurrealDB keeps its entity IDs and all
+    existing triples continue to resolve.
+
+    SurrealDB only allows ``[A-Za-z0-9_]`` in *bare* record ids, but IDs
+    containing other chars (``.``, ``-``, digits leading, etc.) are legal
+    once wrapped in ``⟨…⟩``. The ``surrealdb`` Python client handles that
+    wrapping automatically when a ``RecordID`` is passed as a bound
+    parameter (``$rec``) — verified against SurrealDB 3.0.4 — so callers
+    never have to think about escaping. Every query below uses parameter
+    binding; none interpolate slugs into query strings.
 """
 
 from __future__ import annotations
 
-import re
 from datetime import date
 from typing import Any, Optional
 
@@ -55,12 +72,6 @@ DEFAULT_USER = "root"
 DEFAULT_PASS = "root"
 DEFAULT_NS = "mempalace"
 DEFAULT_DB = "kg"
-
-# SurrealDB record ids have restrictive character rules when not quoted. We
-# match the SQLite ``_entity_id`` normalisation as closely as possible and
-# then strip anything outside ``[a-z0-9_]`` so the raw slug is always a
-# valid bare record id. Display name is preserved on the entity record.
-_SLUG_SAFE_RE = re.compile(r"[^a-z0-9_]+")
 
 
 class KnowledgeGraphSurreal:
@@ -107,15 +118,17 @@ class KnowledgeGraphSurreal:
 
     @staticmethod
     def _entity_id(name: str) -> str:
-        """Normalise a display name to a Surreal-safe slug.
+        """Normalise a display name to a slug.
 
-        Mirrors ``KnowledgeGraph._entity_id`` (lowercase + underscored)
-        with an extra sanitisation pass so the result is a valid bare
-        record id for SurrealDB.
+        Bit-identical to ``KnowledgeGraph._entity_id`` — lowercase, spaces
+        to underscores, strip apostrophes. No extra sanitisation: IDs that
+        contain characters outside ``[a-z0-9_]`` (e.g. ``"dr._chen"``,
+        ``"c3-po"``) are legal SurrealDB record IDs when passed via a
+        bound ``RecordID`` parameter, which is how every query in this
+        module references them. See module docstring ("Slug strategy")
+        for the cross-backend parity rationale.
         """
-        slug = name.lower().replace(" ", "_").replace("'", "")
-        slug = _SLUG_SAFE_RE.sub("", slug)
-        return slug or "unknown"
+        return name.lower().replace(" ", "_").replace("'", "")
 
     @staticmethod
     def _normalize_predicate(predicate: str) -> str:
@@ -233,45 +246,63 @@ class KnowledgeGraphSurreal:
             raise RuntimeError(f"RELATE returned no record for {subject}->{pred}->{obj}")
         return str(created[0]["id"])
 
-    def invalidate(self, triple_id: str, valid_to: Optional[str] = None) -> bool:
-        """Close an open triple by id.
+    def invalidate(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        ended: Optional[str] = None,
+    ) -> bool:
+        """Close the open triple matching ``(subject, predicate, object)``.
 
         Parameters
         ----------
-        triple_id:
-            The Surreal record id of the triple, in either the opaque
-            ``"triple:<rid>"`` form returned by :meth:`add_triple` or the
-            bare ``"<rid>"`` form.
-        valid_to:
+        subject, predicate, obj:
+            The triplet identifying the open fact to close. Normalised the
+            same way as on the write path (see :meth:`add_triple`) so the
+            exact display-name casing used at insert time is not required.
+        ended:
             ISO date/datetime string to stamp on the triple's ``valid_to``
             field. Defaults to today's ISO date, matching the SQLite KG.
 
         Returns
         -------
-        ``True`` if an open triple was closed, ``False`` if the triple
-        either didn't exist or was already closed (idempotent: re-calling
-        with the same ``triple_id`` never double-sets ``valid_to`` or
-        overwrites a prior close).
+        ``True`` if an open triple was closed, ``False`` if no matching
+        open triple existed (idempotent: a second call with the same SPO
+        is a no-op and never overwrites a prior ``valid_to``).
 
         Notes
         -----
-        Parity with ``KnowledgeGraph.invalidate`` is by *semantics* (close
-        only open triples, idempotent) rather than by signature — Surreal
-        gives us stable record ids so we key off those directly instead of
-        re-resolving the ``(subject, predicate, object)`` triplet. The
-        SQLite ``invalidate(subject, predicate, object, ended)`` surface is
-        still available at the caller layer; it can resolve the id via
-        :meth:`query_entity` and hand it to us.
+        Signature matches ``KnowledgeGraph.invalidate`` exactly — the MCP
+        server (``mcp_server.py::tool_kg_invalidate``) calls
+        ``_kg.invalidate(subject, predicate, object, ended=ended)`` without
+        caring which backend is underneath. Earlier mp-84n drafts exposed
+        an id-based surface; mp-s2k restores contract parity. The SQLite
+        KG returns ``None`` from this method, but we return a bool here
+        (``True``/``False``) so callers get a cheap idempotency signal —
+        strictly more informative than the SQLite return, which is a
+        forward-compatible superset.
         """
-        rid = triple_id.split(":", 1)[1] if triple_id.startswith("triple:") else triple_id
-        rec = RecordID("triple", rid)
-        stamp = valid_to if valid_to is not None else date.today().isoformat()
+        sub_rec = self._entity_record(subject)
+        obj_rec = self._entity_record(obj)
+        pred = self._normalize_predicate(predicate)
+        stamp = ended if ended is not None else date.today().isoformat()
         updated = self._db.query(
-            "UPDATE $rec SET valid_to = $valid_to WHERE valid_to IS NONE",
-            {"rec": rec, "valid_to": stamp},
+            (
+                "UPDATE triple SET valid_to = $valid_to "
+                "WHERE in = $sub AND out = $obj "
+                "AND predicate = $pred AND valid_to IS NONE"
+            ),
+            {
+                "sub": sub_rec,
+                "obj": obj_rec,
+                "pred": pred,
+                "valid_to": stamp,
+            },
         )
         # SurrealDB returns the updated rows (empty list if nothing matched
-        # the ``valid_to IS NONE`` predicate — that's the idempotency path).
+        # the ``valid_to IS NONE`` predicate — that's the idempotency path
+        # and also the "unknown triple" path).
         return bool(updated)
 
     # ── Query operations ───────────────────────────────────────────────

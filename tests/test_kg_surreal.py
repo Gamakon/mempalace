@@ -85,17 +85,73 @@ class TestEntity:
     def test_add_entity_returns_slug(self, kg):
         assert kg.add_entity("Alice") == "alice"
 
-    def test_add_entity_slug_normalises_punctuation(self, kg):
-        # "Dr. Chen" -> lowercased, space->_, dot stripped as unsafe char.
-        # Note: diverges from SQLite KG which keeps the literal ".".
-        slug = kg.add_entity("Dr. Chen")
-        assert slug == "dr_chen"
+    def test_add_entity_slug_matches_sqlite(self, kg):
+        # mp-1jb: Surreal slug must be bit-identical to the SQLite KG's
+        # ``_entity_id`` so a palace migrated between backends keeps the
+        # same entity IDs (and all existing triples resolve).
+        assert kg.add_entity("Dr. Chen") == "dr._chen"
 
     def test_add_entity_upsert(self, kg):
         kg.add_entity("Alice", entity_type="person")
         kg.add_entity("Alice", entity_type="engineer")
         stats = kg.stats()
         assert stats["entities"] == 1
+
+
+class TestSlugParityWithSQLite:
+    """mp-1jb: Surreal ``_entity_id`` must be byte-for-byte identical to
+    the SQLite KG's ``_entity_id`` so ingesting the same names into either
+    backend yields the same entity IDs. Without this, a palace re-ingested
+    into the SurrealDB backend creates new entity rows that don't collide
+    with the existing SQLite IDs, and every existing triple points at a
+    ghost.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Dr. Chen",
+            "J.R.R. Tolkien",
+            "O'Brien",
+            "C3-PO",
+            "Alice",
+            "Acme Corp",
+            "Dr. O'Malley",
+            "   ",  # pathological but must not explode
+            "",
+        ],
+    )
+    def test_surreal_slug_matches_sqlite(self, name):
+        from mempalace.kg_surreal import KnowledgeGraphSurreal
+        from mempalace.knowledge_graph import KnowledgeGraph
+
+        # Use the unbound methods directly — no DB connection needed.
+        # ``KnowledgeGraph._entity_id`` is an instance method, but it
+        # doesn't touch ``self``; call it via the class to avoid opening
+        # a SQLite file just for a string op.
+        sqlite_slug = KnowledgeGraph._entity_id(None, name)  # type: ignore[arg-type]
+        surreal_slug = KnowledgeGraphSurreal._entity_id(name)
+        assert surreal_slug == sqlite_slug, (
+            f"Slug divergence for {name!r}: surreal={surreal_slug!r} sqlite={sqlite_slug!r}"
+        )
+
+    def test_known_outputs(self):
+        """Explicit expectations (hardcoded from SQLite's normaliser) so a
+        change to either implementation fails loudly with the exact shape
+        we want, not just a self-consistency check."""
+        from mempalace.kg_surreal import KnowledgeGraphSurreal
+
+        cases = {
+            "Dr. Chen": "dr._chen",
+            "J.R.R. Tolkien": "j.r.r._tolkien",
+            "O'Brien": "obrien",
+            "C3-PO": "c3-po",
+            "Alice": "alice",
+            "Acme Corp": "acme_corp",
+            "Dr. O'Malley": "dr._omalley",
+        }
+        for name, expected in cases.items():
+            assert KnowledgeGraphSurreal._entity_id(name) == expected, name
 
 
 # ── Triple ops ─────────────────────────────────────────────────────────
@@ -282,9 +338,14 @@ class TestTimeline:
 
 
 class TestInvalidate:
+    """Surface must match ``KnowledgeGraph.invalidate(sub, pred, obj, ended=...)``
+    exactly — see mp-s2k. ``mcp_server.tool_kg_invalidate`` calls the SPO
+    form regardless of backend.
+    """
+
     def test_invalidate_sets_valid_to(self, kg):
-        tid = kg.add_triple("Alice", "works_at", "Acme", valid_from="2020-01-01")
-        changed = kg.invalidate(tid, valid_to="2024-06-01")
+        kg.add_triple("Alice", "works_at", "Acme", valid_from="2020-01-01")
+        changed = kg.invalidate("Alice", "works_at", "Acme", ended="2024-06-01")
         assert changed is True
 
         rows = kg.query_relationship("works_at")
@@ -292,40 +353,49 @@ class TestInvalidate:
         assert rows[0]["valid_to"] == "2024-06-01"
         assert rows[0]["current"] is False
 
-    def test_invalidate_defaults_valid_to_to_today(self, kg):
+    def test_invalidate_defaults_ended_to_today(self, kg):
         from datetime import date
 
-        tid = kg.add_triple("Alice", "works_at", "Acme")
-        assert kg.invalidate(tid) is True
+        kg.add_triple("Alice", "works_at", "Acme")
+        assert kg.invalidate("Alice", "works_at", "Acme") is True
 
         rows = kg.query_relationship("works_at")
         assert rows[0]["valid_to"] == date.today().isoformat()
 
     def test_invalidate_is_idempotent(self, kg):
-        """Second call on the same (already-closed) triple is a no-op."""
-        tid = kg.add_triple("Alice", "works_at", "Acme")
-        assert kg.invalidate(tid, valid_to="2024-06-01") is True
+        """Second call with the same SPO after closure is a no-op."""
+        kg.add_triple("Alice", "works_at", "Acme")
+        assert kg.invalidate("Alice", "works_at", "Acme", ended="2024-06-01") is True
         # Second call should not overwrite the earlier valid_to or create
         # a second closure event.
-        assert kg.invalidate(tid, valid_to="2099-12-31") is False
+        assert kg.invalidate("Alice", "works_at", "Acme", ended="2099-12-31") is False
 
         rows = kg.query_relationship("works_at")
         assert rows[0]["valid_to"] == "2024-06-01"
 
     def test_invalidate_unknown_triple_returns_false(self, kg):
-        assert kg.invalidate("triple:does_not_exist") is False
+        """No matching open triple -> falsy, no error (SQLite parity)."""
+        assert kg.invalidate("Ghost", "works_at", "Nowhere") is False
 
-    def test_invalidate_accepts_bare_rid(self, kg):
-        """Callers may pass ``"<rid>"`` as well as ``"triple:<rid>"``."""
-        tid = kg.add_triple("Alice", "works_at", "Acme")
-        bare = tid.split(":", 1)[1]
-        assert kg.invalidate(bare, valid_to="2024-06-01") is True
+    def test_invalidate_mismatched_spo_returns_false(self, kg):
+        """Partial SPO mismatch doesn't close anything, returns falsy."""
+        kg.add_triple("Alice", "works_at", "Acme")
+        # Wrong predicate — open triple stays open.
+        assert kg.invalidate("Alice", "knows", "Acme") is False
+        rows = kg.query_relationship("works_at")
+        assert rows[0]["valid_to"] is None
+
+    def test_invalidate_normalises_predicate(self, kg):
+        """Predicate normalisation matches add_triple so callers can pass
+        either ``"Works At"`` or ``"works_at"``."""
+        kg.add_triple("Alice", "works_at", "Acme")
+        assert kg.invalidate("Alice", "Works At", "Acme", ended="2024-06-01") is True
 
     def test_invalidated_triple_allows_re_add(self, kg):
         """After closing an open triple, re-adding it creates a new open
         row (matches SQLite ``test_invalidated_triple_allows_re_add``)."""
         a = kg.add_triple("Alice", "works_at", "Acme")
-        kg.invalidate(a, valid_to="2024-06-01")
+        kg.invalidate("Alice", "works_at", "Acme", ended="2024-06-01")
         b = kg.add_triple("Alice", "works_at", "Acme")
         assert a != b
         assert kg.stats()["triples"] == 2
