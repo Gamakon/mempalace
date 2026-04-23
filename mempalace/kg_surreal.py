@@ -67,7 +67,10 @@ from typing import Any, Optional
 from surrealdb import RecordID, Surreal
 
 
-DEFAULT_URL = "http://127.0.0.1:8000"
+# mp-85q: WS over HTTP for the same reason as ``backends/surreal.py``'s
+# default — SurrealDB 3.0.4's HTTP path has a concurrent cross-session
+# NS/DB routing bug that the WebSocket wire avoids.
+DEFAULT_URL = "ws://127.0.0.1:8000"
 DEFAULT_USER = "root"
 DEFAULT_PASS = "root"
 DEFAULT_NS = "mempalace"

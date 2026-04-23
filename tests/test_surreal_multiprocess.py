@@ -26,6 +26,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import socket
+import time
 import uuid
 
 import pytest
@@ -394,22 +395,68 @@ def isolated_namespace():
     Each test gets its own namespace so parallel runs of this module do
     not collide. We clean up via a parent-process connection after the
     children have exited.
-    """
-    ns = f"mp_mp_{uuid.uuid4().hex[:12]}"
-    yield ns
-    # Cleanup. Use a short-lived parent backend to issue the REMOVE.
-    try:
-        from mempalace.backends.surreal import SurrealBackend
 
+    Uniqueness hardening (mp-85q): the namespace suffix combines a full
+    uuid4 hex with a nanosecond timestamp so two tests — even on the same
+    machine, same clock-second, and colliding uuid prefixes (astronomically
+    unlikely but the original ``[:12]`` truncation narrowed the space) —
+    can never reuse the same name. Surreal 3.0.4's ``REMOVE NAMESPACE``
+    returns before the storage engine has necessarily reclaimed every key,
+    so recycling a name before the server has flushed would let a stale
+    row appear in what looks like a fresh palace.
+    """
+    ns = f"mp_mp_{uuid.uuid4().hex}_{time.time_ns()}"
+    yield ns
+    _drop_namespace_and_verify(ns)
+
+
+def _drop_namespace_and_verify(ns: str, *, poll_deadline_s: float = 5.0) -> None:
+    """Remove ``ns`` and poll ``INFO FOR KV`` until it is really gone.
+
+    mp-85q fixture hardening. ``REMOVE NAMESPACE`` returns almost
+    immediately on Surreal 3.0.4 but the underlying LSM / WAL flush is
+    asynchronous, so a subsequent test that happens to pick a colliding
+    db-name can race the tail of the previous test's cleanup. We poll
+    ``INFO FOR KV`` after issuing REMOVE so that, by the time the next
+    test starts, the server has actually acknowledged the drop.
+
+    Cleanup failures must not mask the test result, so any exception
+    from the REMOVE itself is swallowed — but the post-REMOVE poll is
+    best-effort and gives up quietly after ``poll_deadline_s`` rather
+    than blocking indefinitely.
+    """
+    from mempalace.backends.surreal import SurrealBackend
+
+    try:
         backend = SurrealBackend(namespace=ns)
+    except Exception:
+        return
+    try:
         try:
             conn = backend._connect("cleanup_dummy")
             conn.query(f"REMOVE NAMESPACE IF EXISTS {ns};")
-        finally:
-            backend.close()
-    except Exception:
-        # Cleanup failure must not mask the test result.
-        pass
+        except Exception:
+            # REMOVE itself failed — best-effort, nothing else we can do.
+            return
+
+        # Poll INFO FOR KV to confirm the namespace is truly gone before
+        # the next test starts. This guards against Surreal's async
+        # reclaim briefly leaving stale keys visible under the same
+        # (ns, db) pair a later test might reuse.
+        deadline = time.monotonic() + poll_deadline_s
+        while time.monotonic() < deadline:
+            try:
+                info = conn.query("INFO FOR KV")
+            except Exception:
+                break
+            if isinstance(info, list):
+                info = info[0] if info else {}
+            namespaces = info.get("namespaces", {}) if isinstance(info, dict) else {}
+            if ns not in namespaces:
+                return
+            time.sleep(0.05)
+    finally:
+        backend.close()
 
 
 @pytest.fixture()
@@ -613,18 +660,6 @@ def test_two_processes_dim_lock_race(isolated_namespace, palace_id):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "mp-85q: flaky under full-module pytest runs — passes reliably in "
-        "isolation but ~30% of full runs observe either an HNSW read-timeout "
-        "(Surreal server stalls on the KNN walk) or an unexpected row id "
-        "appearing in the final get() (possibly stale-key leakage from a "
-        "recycled db-name, or mis-routed write). Solo reproduction works, "
-        "so the test is kept as-is; xfail only defends the full-suite CI "
-        "signal until mp-85q is fixed."
-    ),
-)
 def test_two_processes_concurrent_search_no_interference(isolated_namespace, palace_id):
     """One writer, one reader — reads must never crash, shapes stay typed."""
     # Seed with one vector so the HNSW index exists before the reader
@@ -702,6 +737,163 @@ def test_two_processes_concurrent_search_no_interference(isolated_namespace, pal
         assert not extra, f"unexpected rows after concurrent run: {sorted(extra)}"
     finally:
         backend.close()
+
+
+# ---------------------------------------------------------------------------
+# 4b. Three palaces in three namespaces, concurrent writes + reads — no
+#     cross-palace row leakage (mp-85q regression).
+#
+# Opens THREE palaces (distinct namespaces), writes N drawers to each from
+# three separate writer processes, then reads each palace from a fourth
+# process and asserts that no palace sees any row written to the other two.
+#
+# This is the explicit regression test for mp-85q: under SurrealDB 3.0.4's
+# HTTP wire, concurrent writes from three processes to three distinct
+# (ns, db) pairs caused rows to bleed across namespaces — proven to be a
+# server-side bug in the HTTP handler's session-resolution. The fix was
+# to switch the backend default to WebSocket (``ws://``) which binds NS/DB
+# at session level and is not subject to the race. This test guards that
+# fix: a regression (env override back to HTTP, or a future SDK change
+# that re-enters the HTTP path) will show up as foreign ids leaking
+# between palaces, caught by the per-palace id-set assertion below.
+# ---------------------------------------------------------------------------
+
+
+def _worker_reader_check_palace(
+    *,
+    namespace: str,
+    palace_id: str,
+    expected_ids: list[str],
+    foreign_ids: list[str],
+    queue: "mp.Queue",
+) -> None:
+    """Child: open one palace and return the id-set it sees.
+
+    The parent then asserts the id-set matches only ``expected_ids`` and
+    contains none of ``foreign_ids`` (ids written to OTHER palaces in the
+    same test run). ``foreign_ids`` is passed purely so the child can
+    emit a richer failure message if it trips the guard.
+    """
+    try:
+        from mempalace.backends.surreal import SurrealBackend
+
+        backend = SurrealBackend(namespace=namespace)
+        try:
+            palace = PalaceRef(id=palace_id)
+            col = backend.get_collection(
+                palace=palace, collection_name="mempalace_drawers", create=True
+            )
+            got = col.get()
+            observed = set(got.ids)
+            queue.put(
+                {
+                    "ok": True,
+                    "namespace": namespace,
+                    "palace_id": palace_id,
+                    "observed": sorted(observed),
+                    "expected_missing": sorted(set(expected_ids) - observed),
+                    "foreign_contamination": sorted(observed & set(foreign_ids)),
+                }
+            )
+        finally:
+            backend.close()
+    except Exception as e:
+        import traceback
+
+        queue.put(
+            {
+                "ok": False,
+                "namespace": namespace,
+                "palace_id": palace_id,
+                "error": f"{e!r}\n{traceback.format_exc()}",
+            }
+        )
+
+
+def test_three_palaces_no_cross_namespace_leakage():
+    """Three concurrent writers, three distinct palaces — each stays pure.
+
+    Regression for mp-85q: if the backend ever routes back through the
+    HTTP wire (via ``MEMPALACE_SURREAL_URL`` override, for instance),
+    one palace will observe ids written to another. We don't just
+    assert row counts — we assert the exact id-set each palace sees,
+    so any single cross-namespace row surfaces a clear failure.
+    """
+    n_each = 40
+
+    palaces: list[tuple[str, str, str]] = []
+    for i in range(3):
+        ns = f"mp_mp_{uuid.uuid4().hex}_{time.time_ns()}_{i}"
+        pid = f"palace_{uuid.uuid4().hex[:10]}"
+        prefix = f"palace{i}"
+        palaces.append((ns, pid, prefix))
+
+    # Writers: one child per palace, each writes ``n_each`` drawers with
+    # a palace-specific id prefix.
+    writer_targets = [
+        {
+            "target": _worker_add_drawers,
+            "kwargs": {
+                "namespace": ns,
+                "palace_id": pid,
+                "id_prefix": prefix,
+                "count": n_each,
+            },
+        }
+        for (ns, pid, prefix) in palaces
+    ]
+
+    try:
+        writer_results = _run_children(writer_targets)
+        assert len(writer_results) == 3, f"expected 3 writer results, got {writer_results}"
+        for r in writer_results:
+            assert r["ok"], f"writer {r.get('prefix')!r} failed: {r.get('error')}"
+
+        # Readers: one child per palace. Each reader must see ONLY the
+        # ids written to its own palace, never the other two palaces'
+        # ids.
+        per_palace_expected = {
+            prefix: [f"{prefix}-{i}" for i in range(n_each)] for (_ns, _pid, prefix) in palaces
+        }
+        reader_targets = []
+        for ns, pid, prefix in palaces:
+            foreign_prefixes = [p for (_n, _p, p) in palaces if p != prefix]
+            foreign_ids = [fid for fp in foreign_prefixes for fid in per_palace_expected[fp]]
+            reader_targets.append(
+                {
+                    "target": _worker_reader_check_palace,
+                    "kwargs": {
+                        "namespace": ns,
+                        "palace_id": pid,
+                        "expected_ids": per_palace_expected[prefix],
+                        "foreign_ids": foreign_ids,
+                    },
+                }
+            )
+        reader_results = _run_children(reader_targets)
+        assert len(reader_results) == 3, f"expected 3 reader results, got {reader_results}"
+
+        for r in reader_results:
+            assert r["ok"], (
+                f"reader for palace {r.get('palace_id')!r} "
+                f"in ns {r.get('namespace')!r} failed: {r.get('error')}"
+            )
+            # No foreign contamination: if this trips, mp-85q has regressed.
+            assert not r["foreign_contamination"], (
+                f"palace {r['palace_id']!r} in ns {r['namespace']!r} "
+                f"saw foreign ids {r['foreign_contamination']!r} — "
+                "cross-namespace leakage (mp-85q)"
+            )
+            # All expected rows present.
+            assert not r["expected_missing"], (
+                f"palace {r['palace_id']!r} in ns {r['namespace']!r} "
+                f"missing expected ids {r['expected_missing']!r}"
+            )
+    finally:
+        # Drop every namespace we created, even if the assertions
+        # above fail — we must never leave debris behind.
+        for ns, _pid, _prefix in palaces:
+            _drop_namespace_and_verify(ns)
 
 
 # ---------------------------------------------------------------------------

@@ -191,7 +191,9 @@ class MempalaceConfig:
         * ``surreal`` — the in-tree SurrealDB backend. Requires
           ``pip install -e ".[surreal]"`` and a running SurrealDB server.
           Connection parameters come from ``MEMPALACE_SURREAL_URL``
-          (default ``http://127.0.0.1:8000``),
+          (default ``ws://127.0.0.1:8000`` — WS avoids a concurrent-
+          session routing bug in SurrealDB 3.0.4's HTTP path; see
+          ``backends/surreal.py`` and mp-85q),
           ``MEMPALACE_SURREAL_USER`` (default ``root``), and
           ``MEMPALACE_SURREAL_PASS`` (default ``root``).
 

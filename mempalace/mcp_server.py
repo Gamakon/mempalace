@@ -112,7 +112,7 @@ def _init_kg():
         from .kg_surreal import KnowledgeGraphSurreal
 
         return KnowledgeGraphSurreal(
-            url=os.environ.get("MEMPALACE_SURREAL_URL", "http://127.0.0.1:8000"),
+            url=os.environ.get("MEMPALACE_SURREAL_URL", "ws://127.0.0.1:8000"),
             user=os.environ.get("MEMPALACE_SURREAL_USER", "root"),
             password=os.environ.get("MEMPALACE_SURREAL_PASS", "root"),
         )
@@ -144,7 +144,7 @@ def _get_surreal_backend():
         from .backends.surreal import SurrealBackend
 
         _surreal_backend = SurrealBackend(
-            url=os.environ.get("MEMPALACE_SURREAL_URL", "http://127.0.0.1:8000"),
+            url=os.environ.get("MEMPALACE_SURREAL_URL", "ws://127.0.0.1:8000"),
             username=os.environ.get("MEMPALACE_SURREAL_USER", "root"),
             password=os.environ.get("MEMPALACE_SURREAL_PASS", "root"),
         )

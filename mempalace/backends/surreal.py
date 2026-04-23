@@ -228,7 +228,20 @@ def _retry_on_conflict(fn: F, *, op_name: Optional[str] = None) -> F:
     return wrapper  # type: ignore[return-value]
 
 
-DEFAULT_URL = os.environ.get("MEMPALACE_SURREAL_URL", "http://127.0.0.1:8000")
+# mp-85q: default to WebSocket rather than HTTP. SurrealDB 3.0.4's HTTP
+# path has a cross-session NS/DB routing bug that surfaces under
+# concurrent multi-namespace writes: rows written to (ns_A, db_X) can
+# appear in (ns_B, db_Y) when three or more processes race against the
+# same server. The ``Surreal-NS`` / ``Surreal-DB`` headers the HTTP
+# client sends per request are stateless at the wire level, but the
+# server's session-resolution has a window where concurrent peers
+# briefly observe each other's NS/DB target. The WebSocket wire binds
+# NS/DB at session-level on the server and does not exhibit this bug
+# in our repro (see tests/test_surreal_multiprocess.py
+# ::test_three_palaces_no_cross_namespace_leakage). Legacy callers
+# that still need HTTP can override via the ``MEMPALACE_SURREAL_URL``
+# env var, but they inherit the bug.
+DEFAULT_URL = os.environ.get("MEMPALACE_SURREAL_URL", "ws://127.0.0.1:8000")
 DEFAULT_USER = os.environ.get("MEMPALACE_SURREAL_USER", "root")
 DEFAULT_PASS = os.environ.get("MEMPALACE_SURREAL_PASS", "root")
 DEFAULT_NAMESPACE = os.environ.get("MEMPALACE_SURREAL_NS", "mempalace")
