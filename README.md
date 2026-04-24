@@ -51,6 +51,25 @@ pip install mempalace
 mempalace init ~/projects/myapp
 ```
 
+### From source (with SurrealDB backend)
+
+For concurrent multi-process use (see **Multi-process / team use** below),
+install from source with the optional `surreal` extra:
+
+```bash
+# 1. Install the SurrealDB server (macOS)
+brew install surrealdb/tap/surreal
+
+# 2. Clone and install the package with the Surreal Python client
+git clone https://github.com/Gamakon/mempalace.git
+cd mempalace
+pip install -e ".[surreal]"
+```
+
+Linux/Windows: see https://surrealdb.com/install for the server install.
+Start the server and configure MemPalace following
+[`docs/surrealdb-local.md`](docs/surrealdb-local.md).
+
 ## Quickstart
 
 ```bash
@@ -158,6 +177,10 @@ agents, or hooks may write to the same palace concurrently, switch to the
 **SurrealDB backend**, which supports multi-process concurrent writes:
 
 ```bash
+# Prerequisites: SurrealDB server + mempalace with the [surreal] extra.
+brew install surrealdb/tap/surreal       # macOS; see https://surrealdb.com/install for Linux/Windows
+pip install -e ".[surreal]"              # from a source checkout
+
 export MEMPALACE_BACKEND=surreal
 # or set "backend": "surreal" in ~/.mempalace/config.json
 ```
