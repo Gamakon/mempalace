@@ -405,6 +405,17 @@ def _save_diary_direct(
         f"|msgs:{len(messages)}|recent:{topics}"
     )
 
+    payload = {
+        "ts": now.isoformat(),
+        "session_id": session_id,
+        "wing": wing,
+        "agent_name": "session-hook",
+        "topic": "checkpoint",
+        "entry": entry,
+        "msg_count": len(messages),
+    }
+
+    error_reason = None
     try:
         from .mcp_server import tool_diary_write
 
@@ -428,11 +439,76 @@ def _save_diary_direct(
             if toast:
                 _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
             return {"count": len(messages), "themes": themes}
-        else:
-            _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
+        error_reason = result.get("error", "tool_diary_write returned success=False")
     except Exception as e:
-        _log(f"Diary checkpoint error: {e}")
-    return {"count": 0}
+        error_reason = f"exception: {e}"
+
+    # mp-1o3: write-ahead log so nothing is lost when the MCP/backend path
+    # fails. SessionStart hook replays these so no checkpoint ever goes
+    # silently missing. Entire governance/audit model depends on this.
+    _write_hook_wal(payload, error_reason or "unknown")
+    _log(f"Diary checkpoint failed: {error_reason}; wrote to WAL")
+    return {"count": 0, "failed": True, "reason": error_reason}
+
+
+def _write_hook_wal(payload: dict, error_reason: str) -> None:
+    """Persist a failed hook payload to the WAL for later replay (mp-1o3)."""
+    import os
+
+    wal_dir = Path(os.path.expanduser("~/.mempalace/wal-hooks"))
+    try:
+        wal_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        _log(f"FATAL: could not create WAL dir {wal_dir}: {e}")
+        return
+
+    entry = dict(payload)
+    entry["error_reason"] = error_reason
+
+    fname = wal_dir / f"{payload['ts'].replace(':', '-')}_{payload['session_id']}.json"
+    try:
+        fname.write_text(json.dumps(entry, indent=2), encoding="utf-8")
+    except OSError as e:
+        _log(f"FATAL: could not write WAL entry {fname}: {e}")
+
+
+def replay_hook_wal() -> dict:
+    """Replay any pending WAL entries into the palace. Call from SessionStart."""
+    import os
+
+    wal_dir = Path(os.path.expanduser("~/.mempalace/wal-hooks"))
+    if not wal_dir.is_dir():
+        return {"replayed": 0, "failed": 0, "remaining": 0}
+
+    replayed = 0
+    failed = 0
+    try:
+        from .mcp_server import tool_diary_write
+    except Exception as e:
+        _log(f"replay_hook_wal: cannot import tool_diary_write: {e}")
+        entries = sorted(wal_dir.glob("*.json"))
+        return {"replayed": 0, "failed": 0, "remaining": len(entries)}
+
+    for f in sorted(wal_dir.glob("*.json")):
+        try:
+            payload = json.loads(f.read_text(encoding="utf-8"))
+            result = tool_diary_write(
+                agent_name=payload.get("agent_name", "session-hook"),
+                entry=payload.get("entry", ""),
+                topic=payload.get("topic", "checkpoint"),
+                wing=payload.get("wing", ""),
+            )
+            if result.get("success"):
+                f.unlink()
+                replayed += 1
+            else:
+                failed += 1
+        except Exception as e:
+            _log(f"replay_hook_wal: {f.name} failed: {e}")
+            failed += 1
+
+    remaining = len(list(wal_dir.glob("*.json")))
+    return {"replayed": replayed, "failed": failed, "remaining": remaining}
 
 
 def _ingest_transcript(transcript_path: str):
@@ -615,7 +691,7 @@ def hook_stop(data: dict, harness: str):
 
 
 def hook_session_start(data: dict, harness: str):
-    """Session start hook: initialize session tracking state."""
+    """Session start hook: initialize session tracking state + replay WAL (mp-1o3)."""
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
 
@@ -623,6 +699,27 @@ def hook_session_start(data: dict, harness: str):
 
     # Initialize session state directory
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # mp-1o3: flush any stop-hook payloads the prior session couldn't write.
+    try:
+        status = replay_hook_wal()
+        if status["replayed"] or status["failed"] or status["remaining"]:
+            _log(
+                f"WAL replay: {status['replayed']} restored, "
+                f"{status['failed']} failed, {status['remaining']} remaining"
+            )
+            if status["remaining"] > 0:
+                _output(
+                    {
+                        "systemMessage": (
+                            f"WARNING: {status['remaining']} mempalace hook payloads "
+                            f"in WAL ~/.mempalace/wal-hooks/ — backend still unavailable?"
+                        )
+                    }
+                )
+                return
+    except Exception as e:
+        _log(f"WAL replay error: {e}")
 
     # Pass through — no blocking on session start
     _output({})
