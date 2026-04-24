@@ -171,8 +171,15 @@ def _get_surreal_backend():
         register_instance("surreal", _surreal_backend)
     current_path = _config.palace_path
     if _surreal_palace_ref is None or _surreal_palace_ref_path != current_path:
-        palace_id = "mcp_" + hashlib.sha256(current_path.encode()).hexdigest()[:16]
-        _surreal_palace_ref = PalaceRef(id=palace_id, local_path=current_path)
+        # Use the same derivation as :func:`mempalace.migrate._derive_surreal_db_name`
+        # so a path migrated via ``migrate-to-surreal`` is read back from the
+        # same Surreal database the migration wrote to.
+        from .migrate import _derive_surreal_db_name
+
+        db_name = _derive_surreal_db_name(current_path)
+        _surreal_palace_ref = PalaceRef(
+            id=db_name, local_path=current_path, namespace=db_name
+        )
         _surreal_palace_ref_path = current_path
     return _surreal_backend, _surreal_palace_ref
 

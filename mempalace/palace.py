@@ -65,8 +65,12 @@ def palace_ref_for(palace_path: str) -> PalaceRef:
     ``mcp_server._get_surreal_backend``'s derivation — any drift would
     split a palace's drawer writes across two databases.
     """
-    palace_id = "mcp_" + hashlib.sha256(palace_path.encode()).hexdigest()[:16]
-    return PalaceRef(id=palace_id, local_path=palace_path)
+    # Same derivation as migrate.py so a path migrated via
+    # migrate-to-surreal is read back from the same Surreal database.
+    from .migrate import _derive_surreal_db_name
+
+    db_name = _derive_surreal_db_name(palace_path)
+    return PalaceRef(id=db_name, local_path=palace_path, namespace=db_name)
 
 
 def _active_backend():

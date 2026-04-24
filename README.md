@@ -6,6 +6,96 @@
 > domain — including `mempalace.tech` — is an impostor and may distribute
 > malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
 
+---
+
+> [!IMPORTANT]
+> **Gamakon fork — shared MemPalace over SurrealDB.**
+>
+> This fork adds a **SurrealDB backend** so a team can share one palace
+> across **multiple concurrent Claude Code and OpenClaw sessions**. The
+> upstream ChromaDB backend takes a single-writer SQLite lock — fine for
+> solo use, but fails the moment two agents write at once. SurrealDB lifts
+> that restriction: any number of Claude/OpenClaw processes can read and
+> write the same palace simultaneously.
+>
+> **Quick start (local, solo)**
+>
+> ```bash
+> # 1. Install SurrealDB server (macOS; see https://surrealdb.com/install for other OSes)
+> brew install surrealdb/tap/surreal
+>
+> # 2. Clone this fork and install with the Surreal extra
+> git clone https://github.com/Gamakon/mempalace.git
+> cd mempalace
+> pip install -e ".[surreal]"
+>
+> # 3. Start a local SurrealDB server (see docs/surrealdb-local.md)
+> mkdir -p ~/.mempalace/surreal
+> nohup surreal start --user root --pass root --bind 127.0.0.1:8000 \
+>   surrealkv:///Users/$(whoami)/.mempalace/surreal/surreal.db \
+>   > ~/.mempalace/surreal/server.log 2>&1 &
+>
+> # 4. Tell MemPalace to use Surreal (edit ~/.mempalace/config.json)
+> #    {"backend": "surreal", "palace_path": "..."}
+>
+> # 5. (Optional) Migrate an existing Chroma palace
+> mempalace migrate-to-surreal --include-kg
+> # If the existing Chroma HNSW index is corrupt/huge:
+> mempalace migrate-to-surreal --sqlite-direct --include-kg
+> ```
+>
+> **Shared / networked deployment (team mode)**
+>
+> Run SurrealDB on a host every teammate can reach — laptop, LAN box, or
+> dedicated server. Every client points at the same endpoint.
+>
+> ```bash
+> # On the DB host — bind to a reachable address and set real credentials
+> surreal start --user <ADMIN_USER> --pass <ADMIN_PASS> \
+>   --bind 0.0.0.0:8000 \
+>   surrealkv:///var/lib/mempalace/surreal.db
+>
+> # Firewall: open TCP/8000 to trusted clients only. Run behind a VPN or
+> # reverse proxy with TLS in production — SurrealDB's root auth has no
+> # TLS by default.
+> ```
+>
+> **On each teammate's machine**, set these env vars (or put them in
+> `~/.mempalace/config.json` under `backend`, `surreal_url`, etc.):
+>
+> ```bash
+> export MEMPALACE_BACKEND=surreal
+> export MEMPALACE_SURREAL_URL=ws://db.yourlan:8000   # or wss://... behind TLS
+> export MEMPALACE_SURREAL_USER=<ADMIN_USER>
+> export MEMPALACE_SURREAL_PASS=<ADMIN_PASS>
+> export MEMPALACE_SURREAL_NS=mempalace                # shared namespace for the team
+> ```
+>
+> All Claude Code / OpenClaw sessions on every laptop now write to the
+> same palace. Concurrent writes are race-free (see mp-33y / mp-85q in
+> the Gamakon test suite — 4-process × 100-drawer stress, SIGKILL chaos,
+> 100/100 ops in 4.89s across two sessions).
+>
+> **Gotchas**
+>
+> - The default backend is still `chroma` for upstream compatibility.
+>   You MUST set `backend: surreal` (config.json or env) or nothing changes.
+> - Use `ws://` / `wss://`, **not** `http://` — SurrealDB 3.0.4's HTTP
+>   transport has a cross-session NS/DB routing race under concurrent
+>   writers (see [`docs/surrealdb-upstream-bug-http-ns-race.md`](docs/surrealdb-upstream-bug-http-ns-race.md)).
+> - HNSW index rebuild after a 100k+ drawer migration can take minutes.
+>   First search may block while Surreal settles the index.
+> - If a teammate's MCP server spawns with `"backend": null` (default
+>   Chroma) against a palace that only exists in Surreal, searches
+>   return empty or the CLI segfaults on a corrupt Chroma HNSW. Always
+>   set the backend explicitly.
+>
+> **Upstream docs below describe the single-user, Chroma-backend
+> experience.** Everything still works that way — this fork adds an
+> option, it doesn't remove one.
+
+---
+
 <div align="center">
 
 <img src="assets/mempalace_logo.png" alt="MemPalace" width="240">

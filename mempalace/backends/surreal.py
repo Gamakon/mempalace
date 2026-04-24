@@ -2,8 +2,10 @@
 
 mp-6xi landed drawer CRUD; mp-j19 added hybrid search:
 
-* **HNSW** vector KNN via ``<|K,COSINE|>`` for both ``query_embeddings``
-  and ``query_texts`` (the latter embed-then-search for parity with Chroma).
+* **HNSW** vector KNN via ``<|K,EF|>`` (K = result count, EF = ef_search
+  candidate list size; the distance metric is baked into the index DDL,
+  NOT the operator) for both ``query_embeddings`` and ``query_texts``
+  (the latter embed-then-search for parity with Chroma).
 * **FULLTEXT BM25** via ``DEFINE INDEX ... FULLTEXT ANALYZER ... BM25`` for
   explicit full-text queries triggered by
   ``where_document={'$search': '<tokens>'}``.
@@ -1035,7 +1037,9 @@ class SurrealCollection(BaseCollection):
           provided — mirrors :class:`ChromaCollection.query` and the base
           contract.
         * ``query_embeddings`` → HNSW KNN via
-          ``WHERE embedding <|n,COSINE|> $vec``. Distances are cosine.
+          ``WHERE embedding <|n,ef|> $vec``. The distance metric (cosine)
+          lives in the HNSW index DDL — passing it in the operator slot
+          causes the planner to fall back to brute-force TableScan.
         * ``query_texts`` → embed with the ChromaDB default embedder (the
           same model Chroma uses), then HNSW KNN. This preserves parity
           with the existing ``searcher.py`` orchestration layer, which only
@@ -1050,7 +1054,7 @@ class SurrealCollection(BaseCollection):
         Hybrid approach (mp-j19): the backend exposes BM25 + HNSW as two
         independent paths and lets ``searcher.py`` continue to own the
         cross-path re-ranking. SurrealQL *could* combine them in one query
-        (``... WHERE document @0@ $q OR embedding <|k,COSINE|> $vec``) but
+        (``... WHERE document @0@ $q OR embedding <|k,ef|> $vec``) but
         merging result sets from two indexes inside one ``SELECT`` gives
         non-comparable scores (BM25 vs cosine distance) and eliminates the
         rank-based closet boost that ``search_memories`` depends on. Keeping
@@ -1246,10 +1250,12 @@ class SurrealCollection(BaseCollection):
     ) -> list[dict]:
         """Run a single KNN lookup via HNSW.
 
-        The ``<|K,COSINE|>`` operator does the index walk; we wrap it in a
-        plain ``SELECT`` so we can co-project any ``where=`` /
-        ``where_document=`` predicates. Distance comes out of
-        ``vector::distance::knn()``.
+        The ``<|K,EF|>`` operator does the index walk (distance metric is
+        in the index DDL, not the operator — passing ``COSINE`` there
+        makes the planner fall back to TableScan). We wrap it in a plain
+        ``SELECT`` so we can co-project any ``where=`` / ``where_document=``
+        predicates. Distance comes out of ``vector::distance::knn()``,
+        which reuses the HNSW-computed value.
         """
         select_fields = ["id_ext", "vector::distance::knn() AS _distance"]
         if spec.documents:
@@ -1267,9 +1273,14 @@ class SurrealCollection(BaseCollection):
         bindings["vec"] = _coerce_embedding_to_py_floats(vec)
         n = int(n_results)
 
+        # <|K, EF|> — K is result count, EF is ef_search (candidate list size
+        # at query time). The distance metric is baked into the HNSW index
+        # DDL, NOT the operator. Passing 'COSINE' in the EF position is
+        # malformed and causes the planner to fall back to TableScan
+        # (brute-force cosine over every row). EF=64 is a reasonable default.
         q = (
             f"SELECT {', '.join(select_fields)} FROM {self._table} "
-            f"WHERE embedding <|{n},COSINE|> $vec"
+            f"WHERE embedding <|{n},64|> $vec"
         )
         if filter_clause:
             q += f" AND {filter_clause}"
