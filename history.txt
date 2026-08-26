@@ -1,0 +1,14 @@
+#V2
+INFO FOR DB;
+SELECT count() FROM drawer GROUP ALL;
+SELECT count() FROM closet GROUP ALL;
+SELECT count() FROM drawer GROUP ALL;
+SELECT count() FROM closet GROUP ALL;
+SELECT count() FROM drawer GROUP ALL;
+SELECT count() FROM closet GROUP ALL;
+SELECT count() FROM drawer GROUP ALL;
+SELECT count() FROM closet GROUP ALL;
+SELECT count() FROM drawer GROUP ALL;
+SELECT count() FROM closet GROUP ALL;
+INFO FOR NS;
+SELECT filed_at, id_ext, metadata.wing AS wing, metadata.room AS room FROM drawer ORDER BY filed_at ASC LIMIT 3;
